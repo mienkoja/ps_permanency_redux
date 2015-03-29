@@ -1,0 +1,1434 @@
+---
+title: "Parent Survey Reunification Analysis Redux"
+output:
+  pdf_document:
+    toc: yes
+  html_document:
+    theme: cerulean
+    toc: yes
+  word_document: default
+---
+
+```{r preliminary, include=FALSE}
+#load citation package and clear the bibliography
+require(bibtex)
+require(knitcitations)
+newbib()
+write.bib(c('RODBC', 'xtable', 'mstate', 'survival', 'reshape2', 'ggplot2', 'extrafont', 'pander', 'sqldf', 'ltm'), file="package.bib")
+packbib <- read.bib("package.bib")
+regbib <- read.bib("bibliography.bib")
+
+#load the RODBC library
+require(RODBC)
+#make pretty tables
+require(pander)
+#handle multi-state data
+require(mstate)
+#load ggplot for plotting
+require(ggplot2)
+#load reshape for melting
+require(reshape2)
+#load POC colors, et al.
+require(pocr)
+#load nice fonts
+require(extrafont)
+#allow sql querying of data frames
+require(sqldf)
+#calculate IRT model
+require(ltm)
+#load lubridate to handle dates
+require(lubridate)
+```
+# Overview
+
+Our overall goal in this analysis is to examine the timing of permanency outcomes for the children of parents who were surveyed in a comprehensive survey of child-welfare involved parents in Washington State in 2008. Although the survey addressed parents who were served in-home and out-of-home, the analyses here will be limited to those parents who had at least one child placed in out-of-home care. This steps taken here will build toward a competing-risk event-history model.  
+
+# Getting the Data
+
+## Accessing the Original Survey Data
+
+In order to solve a gap in institutional knowledge concerning the precise exclusion criteria used by prior POC staff, all available data files from the original SACWIS matches were exported to the POC2 SQL Server. The source files are in SPSS format and were exported using the SPSS database export utility over an ODBC connection. The source files are available to authorized POC analysts at the following path: 
+
+`\\poc2\Practice Model\PARENT SURVEY I\Reunification Analysis_Parent Survey\Original Data Files\Matt`
+
+All files with at least a `dcid` (parent id for the survey) and a `Person ID` (child id from SACWIS) were imported to the SQL server in `dbCoreAdministrativeTables` in a schema names `survey`. These files were then unioned into a single table `ps_tbl_children` using the following SQL script: 
+
+
+        if object_id('dbo.ps_tbl_children') is not null 
+          drop table dbo.ps_tbl_children
+        
+        select
+          dcid
+          ,id_prsn_child
+          ,min(placement_date) placement_date 
+        into dbo.ps_tbl_children 
+        from(
+        	select 
+        		dcid
+        		,person_id id_prsn_child
+        		,placement_date
+        	from 
+        		dbo.ps_open_matt_match_back
+        	union
+        	select 
+        		dcid
+        		,id_prsn id_prsn_child
+        		,coalesce(placement_date, place_start) placement_date
+        	from 
+        		dbo.ps_open_mtt_match_back_famlink_missed_36			
+        	union
+        	select 
+        		study_id dcid
+        		,person_id id_prsn_child
+        		,placement_date
+        	from 
+        		dbo.ps_Original_Openwithplacements_BA_added	
+        	union
+        	select 
+        		dcid
+        		,id_prsn id_prsn_child
+        		,place_start placement_date
+        	from 
+        		dbo.ps_still_open_match_back_from_famlink) tmp
+        group by 
+        	dcid
+        	,id_prsn_child
+        ) tmp
+
+
+This provides us with a cross-walk between the `dcid` and `Person ID` (hereafter `id_prsn_child`) for further use in our analysis.
+
+We next load the data from the parent survey itself. These data are available in another SPSS file located at the following path:  
+
+`\\poc2\Practice Model\PARENT SURVEY I\Parent Data\Original Data\POC FINAL DATA.sav`
+
+As with the files described above, we export the data from SPSS to SQL Server on POC2 using the SPSS database utility. The data are stored in a table named `ps_tbl_parent_data`. We can join the two tables together using a SQL script. Here, however, we will do this directly in R using the `RODBC` package by `r citet(packbib[1])`.
+
+```{r select_overall, tidy=FALSE, cache=TRUE}
+#assign a connection object
+cn <- odbcConnect("POC")
+
+#use the connection object to send a query to our database
+dat1 <- sqlQuery(cn, 
+                "select 
+                  *
+                  ,id_prsn_child
+                from ps_tbl_parent_data tpd
+                	join ps_tbl_children tc
+                	on tpd.dcid=tc.dcid")
+
+#count the number of parents
+dat1_par <- length(unique(dat1$DCID))
+dat1_par
+
+#count the number of children
+dat1_chi <- length(unique(dat1$id_prsn_child))
+dat1_chi
+```
+
+We can see from the above counts that the numbers are somewhat less than what are reported in other [POC documents](https://docs.google.com/viewer?url=http%3A%2F%2Fpartnersforourchildren.org%2Fsites%2Fdefault%2Ffiles%2Fpublications%2F2009._part_iv_baseline_parent_survey_analysis.pdf). Specifically, the link in the previous sentence shows a report in which POC reports to have completed surveys for 464 out-of-home cases. While this is true, only `r dat1_par` of these cases were able to be linked to an actual out-of-home placement using the original methodology. 
+
+## Linking data to an actual removal record
+
+The original methodology involved manually linking some survey records to placement dates in the SACWIS. While this may increase the overall number of linkages, it decreases replicability when the linking method cannot be scripted. Furthermore, as we are interested in building an event-history model with time-varying covariates (e.g. engagement), it is important that we have a clear linking strategy to ensure that we are only examining survey responses of parents who had a child in out-of-home care at the time of their interview.  
+
+As such, we re-link the `id_prsn_child` fields from the `r dat1_par` records using the code shown below. In this code, we first write a common table expression to select the first `id_removal_episode_fact` within the 365 days preceding the parent's interview. We then use this id to select a complete set of records including all parent survey data (`ps_tbl_parent_data`) and all data from the `rptPlacements` base working table.
+
+
+```{r select_reasonable_matches, tidy=FALSE, cache=TRUE}
+dat2 <- sqlQuery(cn, 
+                "with child_rem_id (dcid, id_prsn_child, id_removal_episode_fact) 
+                as
+                (
+                select
+                  tpd.dcid
+                  ,tc.id_prsn_child
+                  ,min(id_removal_episode_fact) id_removal_episode_fact
+                from 
+                	dbo.ps_tbl_parent_data tpd
+                		join dbo.ps_tbl_children tc
+                			on tpd.dcid=tc.dcid
+        						join vw_episodes vep
+        							on vep.eps_begin <= tpd.intdate 
+        								and vep.eps_begin >= dateadd(dd, -365, tpd.intdate)
+                        				and vep.id_prsn_child=tc.id_prsn_child
+                        group by 
+                        	tpd.dcid
+                        	,tc.id_prsn_child
+                        )
+                        select distinct
+        					cri.id_prsn_child
+                        	,cri.id_removal_episode_fact 
+        					--check for records of dependency from AOC data
+        					--for any dependency date that takes place after permanency, set date to null
+        					,case 
+        						when datediff(dd
+                                  ,isnull(vep.petition_dependency_date
+                                          ,vep.eps_begin)
+                                  ,isnull(vep.earlier_of_eps_end_18th_bday
+                                          ,'2013-12-31')) < 0
+        						then null
+        						else vep.petition_dependency_date
+        					end dep_date
+        					--calculate the timing of court involvement 
+        					,case 
+        						--check for petitions before removal and set time to 0
+        						when 
+        							datediff(dd
+                              ,vep.eps_begin
+                              ,isnull(vep.petition_dependency_date
+                                      ,vep.eps_begin)) < 0 
+        						then 
+        							0
+        						--treat missing dependency dates (from logic above) with dur_days 
+                    --greater than 365 as immediate dependencies
+        						when 
+        							case 
+        							
+        								when datediff(dd
+                                      ,isnull(vep.petition_dependency_date
+                                              ,vep.eps_begin)
+                                      ,isnull(vep.earlier_of_eps_end_18th_bday
+                                              ,'2013-12-31')) < 0
+        								then null
+        								else vep.petition_dependency_date
+        							end is null 
+        							and 
+        							dur_days > 365
+        						then 
+        							0
+        						--treat missing dependency dates with dur_days less than 365 as VPA cases
+        						when 
+        							case 	
+        								when datediff(dd
+                                      ,isnull(vep.petition_dependency_date
+                                              ,vep.eps_begin)
+                                      ,isnull(vep.earlier_of_eps_end_18th_bday
+                                              ,'2013-12-31')) < 0
+        								then null
+        								else vep.petition_dependency_date
+        							end is null 
+        						then 
+        							dur_days
+        						--check for petitions after permanency and set time to episode duration
+        						when
+        							datediff(dd
+                                ,vep.petition_dependency_date
+                                ,isnull(vep.earlier_of_eps_end_18th_bday
+                                        ,'2013-12-31')) < 0
+        						then 
+        							dur_days
+        						--for all other cases just calculate the time from 
+                    --eps_begin to the AOC petition 
+        						else 
+        							datediff(dd
+                              ,vep.eps_begin
+                              ,isnull(vep.petition_dependency_date
+                                      ,vep.eps_begin))
+        					end crt_t
+        					,case 
+        						--check for petitions before removal and flag as court involvement
+        						when 
+        							datediff(dd
+                              ,vep.eps_begin
+                              ,isnull(vep.petition_dependency_date
+                                      ,vep.eps_begin)) < 0 
+        						then 
+        							1
+        						--treat missing dependency dates (from logic above) with 
+                    --dur_days greater than 365 as immediate dependencies
+        						when 
+        							case 
+        								when datediff(dd
+                                      ,isnull(vep.petition_dependency_date
+                                              ,vep.eps_begin)
+                                      ,isnull(vep.earlier_of_eps_end_18th_bday
+                                              ,'2013-12-31')) < 0
+        								then null
+        								else vep.petition_dependency_date
+        							end is null 
+        							and 
+        							dur_days > 365
+        						then 
+        							1
+        						--treat missing dependency dates with dur_days less than 365 as VPA cases
+        						when 
+        							case 
+        								when datediff(dd
+                                      ,vep.petition_dependency_date
+                                      ,isnull(vep.earlier_of_eps_end_18th_bday
+                                              ,'2013-12-31')) < 0
+        								then null
+        								else vep.petition_dependency_date
+        							end is null 
+        						then 
+        							0
+        						--check for petitions after permanency and set time to episode duration
+                    --(effectively VPAs)
+        						when
+        							datediff(dd
+                              ,vep.petition_dependency_date
+                              ,isnull(vep.earlier_of_eps_end_18th_bday
+                                      ,'2013-12-31')) < 0
+        						then 
+        							0
+        						--for all other cases just calculate the time from eps_begin to the 
+                    --AOC or CA petition 
+        						else 
+        							1
+        					end crt_s
+        					,dur_days reu_t
+        					,case
+        						when outcome = 'Reunification' then 1 else 0
+        					end reu_s
+        					,dur_days adt_t
+        					,case
+        						when outcome = 'Adoption' then 1 else 0
+        					end adt_s
+        					,dur_days gdn_t
+        					,case
+        						when outcome = 'Guardianship' then 1 else 0
+        					end gdn_s
+  						    ,datediff(dd, vep.eps_begin, tpd.intdate) time_to_int
+        					,tpd.* 
+                  ,vep.*
+                        from
+                        	dbo.ps_tbl_parent_data tpd
+                        		join child_rem_id cri
+                        			on tpd.dcid=cri.dcid
+        						join vw_episodes vep
+        							on vep.id_removal_episode_fact = cri.id_removal_episode_fact
+        				order by vep.id_removal_episode_fact")
+
+#count the number of parents
+dat2_par <- length(unique(dat2$DCID))
+dat2_par
+
+#count the number of children
+dat2_chi <- length(unique(dat2$id_prsn_child))
+dat2_chi
+```
+
+As can be seen, we are left with `r dat2_par`  parents and `r dat2_chi`  children. To be clear, there are other `id_removal_episode_fact` matches for the original matches of children. However, the removal episodes for these children are either over 1 year before the interview date or after the interview date. We are thus left with administrative data matches for approximately `r 100*round(dat2_par/dat1_par, 2)` percent of the surveyed families who were identified as out-of-home care cases. 
+
+# Excluding Subjects by Case Characteristics
+
+The child welfare system in Washington engages families in an extremely heterogeneous manner. One of the major distinctions between out-of-home care cases is the extent to which children are engaged by the court system. Some children enter out-of-home (OOH) care by way of a voluntary placement agreement (VPA), some children enter OOH care by way of a court order, and some begin their stay in OOH in a VPA and then transition to placement under a court order. Identifying these children is important as the path they take through the system significantly impacts their probability of exiting the system at any given time `r citep("10.1016/j.childyouth.2012.08.004")`. In our initial match of survey data above, we created a new variable called `crt_s` which indicated the extent to which a child had any court involvement in their dependency^1^. 
+
+```{r count_court_cases, results='asis', cache=TRUE, echo=FALSE}
+pander(table(factor(dat2$crt_s,levels=c(0,1),labels=c("No Court", "Court")), dnn="Count"))
+```
+
+As can be seen there are 53 children who had no court involvement in their case. While event history models are flexible enough to include children who started in a VPA "state" and then transitions to either court involvement or some form of permanency, (see `r citet("10.1002/sim.2712")` for a review of this approach), the relatively small number of children starting in this state will not likely yield meaningful results. Including them in our analysis may, however, bias the results of our analysis of court-involved children. As such, these children will be excluded from our analysis. 
+
+Our study also includes a small number of children who, at the time of our last observation, had experienced either no permanency outcome or had experienced an outcome classified as "other". 
+
+```{r count_odd_outcomes, results='asis', echo=FALSE, cache=TRUE}
+pander(table(dat2$outcome, dnn="Count"), split.table = Inf)
+```
+
+
+While event history methods certainly provide for the ability to handle such observations (mainly through identifying the children as right-censored as described by `r citet("10.2307/2529941")`), we are also interested in estimating the probability that children will not exit the system (i.e. the probability that they will "age-out" of care). While child welfare scholars typically treat these children as right-censored to observation in analyses, it is of substantive interest to determine the probability that children will age-out of care. In a multi-state approach to permanency outcomes, an analyst could include an additional "age-out" state in their model and derive a probability from this analysis. This approach, however, would make the implicit (and erroneous) assumption that children are at a constant risk of transitioning to the "age-out" state. While children are (in principle) at a constant risk of exiting to a given permanency outcome, they cannot age-out of care until they reach the age of majority. By excluding the small number of children who are still in care as of our last observation and children who have exited to a permanency type of "Other" (i.e. children who we would have traditionally treated as right censored), we will be freed to calculate a probability of aging out through simple arithmetic as shown below.
+
+The small chunk of code below further subsets our data to children who exited to permanency by the end of 2013 and who had court involvement in their placement. 
+
+```{r final_data_subset}
+dat3 <- subset(dat2, !(dat2$outcome %in% c("Still in Care", "Other")) & dat2$crt_s == 1)
+#count the number of parents
+dat3_par <- length(unique(dat3$DCID))
+dat3_par
+
+#count the number of children
+dat3_chi <- length(unique(dat3$id_prsn_child))
+dat3_chi
+```
+
+The resulting sample includes `r dat3_par`  parents and `r dat3_chi`  children.
+
+# Reviewing our Data
+
+To begin reviewing the data, the first thing we want to do is get a sense of the outcomes for the `r dat3_chi`children. This will be accomplished through the use of the `mstate` package as described by `r citet("10.1016/j.cmpb.2010.01.001")`. 
+
+## Prepare Data
+
+In order to make use of the `mstate` package, there are a couple of preliminary steps that need to be taken:
+
+1. Add a day to all values of time that we have^2. 
+2. Define a transition matrix using `transMat()`.
+3. Create an `msdata` `data.frame` using `msprep()`. 
+
+```{r prep_data_for_mstate, tidy=FALSE, cache=TRUE}
+
+dat3$crt_t_mod <- dat3$crt_t + 1
+dat3$reu_t_mod <- dat3$reu_t + 1
+dat3$adt_t_mod <- dat3$adt_t + 1
+dat3$gdn_t_mod <- dat3$gdn_t + 1
+
+tmat <- transMat(x = list(c(2,3,4)
+                          ,c()
+                          ,c()
+                          ,c())
+                 ,names = c("plc"
+                           ,"reu"
+                           ,"adt"
+                           ,"gdn"))
+tmat
+
+ms_dat3 <- msprep(data=dat3
+                  ,trans=tmat
+                  ,time = c(NA
+                            ,"reu_t_mod"
+                            ,"adt_t_mod"
+                            ,"gdn_t_mod")
+                  ,status = c(NA
+                            ,"reu_s"
+                            ,"adt_s"
+                            ,"gdn_s")
+                  )
+```
+
+
+## Examine Data 
+### Outcomes
+
+The `events()` function allows us to see the proportion of children transitioning into each state (i.e. outcome) in our model. Of note is the "no-event" proportion. Based on the manner in which we subset our data above, this is precisely the proportion (0.07) who age-out of the system. Of note, there are no proportions indicates in the bottom three rows of the transition matrix, this is because Reunification, Adoption, and Guardianship are absorbing states in this model - for the purposes of this analysis, you cannot transition out of these states. 
+
+```{r examine_events, cache=TRUE}
+event_prop <- events(ms_dat3)$Proportions
+colnames(event_prop) <- c("Placement in OOH","Reunification","Adoption","Guardianship","No Event")
+rownames(event_prop) <- c("Placement in OOH","Reunification","Adoption","Guardianship")
+```
+
+```{r print_table_of_events, results='asis', echo=FALSE, cache=TRUE}
+pander(ifelse(is.nan(event_prop), "", round(as.numeric(event_prop), 2)), split.table = Inf)
+```
+
+### Analytic Approach
+
+While there are a variety of approaches that we could take to more formally analyze these data, we have decided to approach this analysis by means of multinomical logistic regression. 
+
+```{r select_covariates}
+
+#add outcome for emancipation 
+dat3$emc_s <- ifelse(dat3$reu_s + dat3$adt_s + dat3$gdn_s == 1, 0, 1)
+
+#prep covariates
+dat3$log_age_eps_begin <- log1p(dat3$age_eps_begin)
+dat3$ad_chld <- ifelse(dat3$age_eps_begin > 11, 1, 0)  
+dat3$sm_chld <- ifelse(dat3$age_eps_begin <= 3, 1, 0) 
+dat3$non_min <- ifelse(dat3$cd_race_census == 5, 1, 0)
+dat3$male <- ifelse(dat3$cd_gndr == "M", 1, 0)
+dat3$par_age <- year(strptime(dat3$eps_begin, format = "%Y-%m-%d"))-year(strptime(dat3$DOB, format = "%Y-%m-%d"))
+dat3$log_par_age <- log(dat3$par_age)
+dat3$married <- ifelse(dat3$MARSTAT < 1, NA, ifelse(dat3$MARSTAT == 2, 1, 0))
+dat3$hhnum_c <- ifelse(dat3$CHTOTNUM < 1, NA, dat3$CHTOTNUM)
+dat3$rel_plc <- ifelse(as.numeric(dat3$longest_plcm_setng)==3,1,0)
+dat3$eps_rank <- dat3$eps_rank
+dat3$log_eps_rank <- log(dat3$eps_rank)
+
+dat3$housing_hs_cnt <- ifelse(is.na(dat3$LACRENT) == TRUE | dat3$LACRENT == 2, 0, 1) +
+                        ifelse(is.na(dat3$EVICT) == TRUE | dat3$EVICT == 2, 0, 1) + 
+                        ifelse(is.na(dat3$FAMFRND) == TRUE | dat3$FAMFRND == 2, 0, 1) + 
+                        ifelse(is.na(dat3$REPOSS) == TRUE | dat3$REPOSS == 2, 0, 1) + 
+                        ifelse(is.na(dat3$HOMLSS) == TRUE | dat3$HOMLSS == 2, 0, 1) 
+dat3$hsg_hds <- ifelse(dat3$housing_hs_cnt > 0, 1, 0)
+dat3$high_in <- ifelse(dat3$THHINC < 1, NA, ifelse(dat3$THHINC > 1, 1, 0))
+dat3$sm_coll <- ifelse(dat3$EDULVL < 1, NA, ifelse(dat3$EDULVL > 3, 1, 0))
+dat3$employ <- ifelse(dat3$EMPSTAT < 1, NA, ifelse(dat3$EMPSTAT != 1, 1, 0))
+
+
+dat3$y2 = ifelse(dat3$YENG2 < 1, NA, dat3$YENG2)
+dat3$y3 = ifelse(dat3$YENG3 < 1, NA, dat3$YENG3)
+dat3$y7 = ifelse(dat3$YENG7 < 1, NA, dat3$YENG7)
+dat3$y15 = ifelse(dat3$YENG15 < 1, NA, dat3$YENG15)
+dat3$y5 = ifelse(dat3$YENG5 < 1, NA, dat3$YENG5)
+dat3$y9 = ifelse(dat3$YENG9 < 1, NA, dat3$YENG9)
+dat3$y11 = ifelse(dat3$YENG11 < 1, NA, dat3$YENG11)
+dat3$y16 = ifelse(dat3$YENG16 < 1, NA, dat3$YENG16)
+dat3$y6 = ifelse(dat3$YENG6 < 1, NA, dat3$YENG6)
+dat3$y12 = ifelse(dat3$YENG12 < 1, NA, dat3$YENG12)
+dat3$y19 = ifelse(dat3$YENG18 < 1, NA, dat3$YENG18)
+dat3$y1 = ifelse(dat3$YENG1 < 1, NA, dat3$YENG1)
+dat3$y4 = ifelse(dat3$YENG4 < 1, NA, dat3$YENG4)
+dat3$y8 = ifelse(dat3$YENG8 < 1, NA, dat3$YENG8)
+dat3$y10 = ifelse(dat3$YENG10 < 1, NA, dat3$YENG10)
+dat3$y13 = ifelse(dat3$YENG13 < 1, NA, dat3$YENG13)
+dat3$y14 = ifelse(dat3$YENG14 < 1, NA, dat3$YENG14)
+dat3$y17 = ifelse(dat3$YENG19 < 1, NA, dat3$YENG19)
+dat3$y18 = ifelse(dat3$YENG17 < 1, NA, dat3$YENG17)
+
+#transform our variables
+#linear
+require(stringr)
+var_tx_lin <- dat3[,c(350:368)] - 3
+nam <- names(var_tx_lin)
+
+names(var_tx_lin) <- str_c(nam, '_lin')
+#signed square transform
+var_tx_sgnsq <- sign(var_tx_lin) * abs(var_tx_lin)^2
+names(var_tx_sgnsq) <- str_c(nam, '_signsq')
+#signed square root transform
+var_tx_sgnsqrt <- sign(var_tx_lin) * sqrt(abs(var_tx_lin))
+names(var_tx_sgnsqrt) <- str_c(nam, '_signsqrt')
+#ternary transform
+var_tx_tern <- lapply(dat3[,c(350:368)]
+                      ,function(x) as.numeric(as.character(cut(x
+                                       ,breaks = c(0,2,3,5)
+                                       ,labels=c(-1,0,1)
+                                       )))
+                      )
+var_tx_tern <- as.data.frame(var_tx_tern)
+names(var_tx_tern) <- str_c(nam, '_tern')
+
+dat3$y2_fac = as.factor(ifelse(dat3$YENG2 < 1, NA, dat3$YENG2))
+dat3$y3_fac = as.factor(ifelse(dat3$YENG3 < 1, NA, dat3$YENG3))
+dat3$y7_fac = as.factor(ifelse(dat3$YENG7 < 1, NA, dat3$YENG7))
+dat3$y15_fac = as.factor(ifelse(dat3$YENG15 < 1, NA, dat3$YENG15))
+dat3$y5_fac = as.factor(ifelse(dat3$YENG5 < 1, NA, dat3$YENG5))
+dat3$y9_fac = as.factor(ifelse(dat3$YENG9 < 1, NA, dat3$YENG9))
+dat3$y11_fac = as.factor(ifelse(dat3$YENG11 < 1, NA, dat3$YENG11))
+dat3$y16_fac = as.factor(ifelse(dat3$YENG16 < 1, NA, dat3$YENG16))
+dat3$y6_fac = as.factor(ifelse(dat3$YENG6 < 1, NA, dat3$YENG6))
+dat3$y12_fac = as.factor(ifelse(dat3$YENG12 < 1, NA, dat3$YENG12))
+dat3$y19_fac = as.factor(ifelse(dat3$YENG18 < 1, NA, dat3$YENG18))
+dat3$y1_fac = as.factor(ifelse(dat3$YENG1 < 1, NA, dat3$YENG1))
+dat3$y4_fac = as.factor(ifelse(dat3$YENG4 < 1, NA, dat3$YENG4))
+dat3$y8_fac = as.factor(ifelse(dat3$YENG8 < 1, NA, dat3$YENG8))
+dat3$y10_fac = as.factor(ifelse(dat3$YENG10 < 1, NA, dat3$YENG10))
+dat3$y13_fac = as.factor(ifelse(dat3$YENG13 < 1, NA, dat3$YENG13))
+dat3$y14_fac = as.factor(ifelse(dat3$YENG14 < 1, NA, dat3$YENG14))
+dat3$y17_fac = as.factor(ifelse(dat3$YENG19 < 1, NA, dat3$YENG19))
+dat3$y18_fac = as.factor(ifelse(dat3$YENG17 < 1, NA, dat3$YENG17))
+
+#reverse code for averaging
+dat3$y3 = ifelse(dat3$YENG3 < 1, NA, -dat3$YENG3+6) 
+dat3$y5 = ifelse(dat3$YENG5 < 1, NA, -dat3$YENG5+6)
+dat3$y16 = ifelse(dat3$YENG16 < 1, NA, -dat3$YENG16+6)
+dat3$y6 = ifelse(dat3$YENG6 < 1, NA, -dat3$YENG6+6)
+
+
+dat3$rec <- rowMeans(dat3[,c(350:353)])
+dat3$wrk <- rowMeans(dat3[,c(354:357)])
+dat3$mis <- rowMeans(dat3[,c(358:360)])
+dat3$buy <- rowMeans(dat3[,c(361:368)])
+dat3$eng <- rowMeans(dat3[,c(350:368)])
+
+dat3_reu <- cbind(reu_s = dat3$reu_s
+                  ,var_tx_tern
+                  ,var_tx_sgnsq
+                  ,var_tx_sgnsqrt
+                  ,var_tx_lin
+                  ,dat3[,c(369:387)]
+                  ,rec = dat3$rec
+                  ,wrk = dat3$wrk
+                  ,mis = dat3$mis
+                  ,buy = dat3$buy
+                  ,eng = dat3$eng
+                  ,dat3[,c(350:368)])
+
+dat3_adt <- cbind(adt_s = dat3$adt_s
+                  ,var_tx_tern
+                  ,var_tx_sgnsq
+                  ,var_tx_sgnsqrt
+                  ,var_tx_lin
+                  ,dat3[,c(369:387)]
+                  ,rec = dat3$rec
+                  ,wrk = dat3$wrk
+                  ,mis = dat3$mis
+                  ,buy = dat3$buy
+                  ,eng = dat3$eng
+                  ,dat3[,c(350:368)])
+
+
+dat3_gdn <- cbind(gdn_s = dat3$gdn_s
+                  ,var_tx_tern
+                  ,var_tx_sgnsq
+                  ,var_tx_sgnsqrt
+                  ,var_tx_lin
+                  ,dat3[,c(369:387)]
+                  ,rec = dat3$rec
+                  ,wrk = dat3$wrk
+                  ,mis = dat3$mis
+                  ,buy = dat3$buy
+                  ,eng = dat3$eng
+                  ,dat3[,c(350:368)])
+
+
+dat3_emc <- cbind(emc_s = dat3$emc_s
+                  ,var_tx_tern
+                  ,var_tx_sgnsq
+                  ,var_tx_sgnsqrt
+                  ,var_tx_lin
+                  ,dat3[,c(369:387)]
+                  ,rec = dat3$rec
+                  ,wrk = dat3$wrk
+                  ,mis = dat3$mis
+                  ,buy = dat3$buy
+                  ,eng = dat3$eng
+                  ,dat3[,c(350:368)])
+
+```
+
+
+```{r deal_with_engagement_reu, cache=TRUE}
+#Which engagement variables to use?
+
+source('eval_measure_glm.R')
+
+varlist <- names(dat3_reu[,c(2:length(names(dat3_reu)))])
+
+eng_reu <- eval_measure_glm(y = "reu_s", varlist = varlist, dat = dat3_reu, iter = 100)
+
+eng_reu$good_prediction <- ifelse(eng_reu$avg_prp_cor_hi > eng_reu$thresh_hi & eng_reu$avg_prp_cor_lo > eng_reu$thresh_lo
+                                  ,1,0)
+
+eng_reu$sig <- ifelse(eng_reu$pvalue < .05
+                                  ,1,0)
+
+eng_reu[eng_reu$good_prediction == 1 & eng_reu$sig == 1,]
+
+```
+
+
+```{r deal_with_engagement_adt, cache=TRUE}
+#Which engagement variables to use?
+
+source('eval_measure_glm.R')
+
+varlist <- names(dat3_adt[,c(2:length(names(dat3_adt)))])
+
+eng_adt <- eval_measure_glm(y = "adt_s", varlist = varlist, dat = dat3_adt, iter = 100)
+
+eng_adt$good_prediction <- ifelse(eng_adt$avg_prp_cor_hi > eng_adt$thresh_hi & eng_adt$avg_prp_cor_lo > eng_adt$thresh_lo
+                                  ,1,0)
+
+eng_adt$sig <- ifelse(eng_adt$pvalue < .05
+                                  ,1,0)
+
+eng_adt[eng_adt$good_prediction == 1 & eng_adt$sig == 1,]
+```
+
+```{r deal_with_engagement_gdn, cache=TRUE}
+#Which engagement variables to use?
+
+source('eval_measure_glm.R')
+
+varlist <- names(dat3_gdn[,c(2:length(names(dat3_gdn)))])
+
+eng_gdn <- eval_measure_glm(y = "gdn_s", varlist = varlist, dat = dat3_gdn, iter = 100)
+
+eng_gdn$good_prediction <- ifelse(eng_gdn$avg_prp_cor_hi > eng_gdn$thresh_hi & eng_gdn$avg_prp_cor_lo > eng_gdn$thresh_lo
+                                  ,1,0)
+
+eng_gdn$sig <- ifelse(eng_gdn$pvalue < .05
+                                  ,1,0)
+
+eng_gdn[eng_gdn$good_prediction == 1 & eng_gdn$sig == 1,]
+```
+
+```{r deal_with_engagement_emc, cache=TRUE}
+#Which engagement variables to use?
+
+source('eval_measure_glm.R')
+
+varlist <- names(dat3_emc[,c(2:length(names(dat3_emc)))])
+
+eng_emc <- eval_measure_glm(y = "emc_s", varlist = varlist, dat = dat3_emc, iter = 100)
+
+eng_emc$good_prediction <- ifelse(eng_emc$avg_prp_cor_hi > eng_emc$thresh_hi & eng_emc$avg_prp_cor_lo > eng_emc$thresh_lo
+                                  ,1,0)
+
+eng_emc$sig <- ifelse(eng_emc$pvalue < .05
+                                  ,1,0)
+
+eng_emc[eng_emc$good_prediction == 1 & eng_emc$sig == 1,]
+```
+
+Engagement items were only able to significantly and reliably predict reunification as an outcome in our binomial corss-validation process. 
+
+If more than one transformation of an engagement item was identified as a significant and reliable predictor, the item producing the minimum log-likelihood was selected. 
+
+This resulted in the following 7 items being selected for inclusion in the BMA
+
+1. y5_signsq "It's hard for me to work with my assigned worker" (Reverse Coded)
+2. y6_signsq "Anything I say they're going to turn it around to make me look bad" (Reverse Coded)
+3. y9_tern "I think my worker and I respect each other"
+4. y10_tern "My worker keeps me informed about what is happening with my case"
+5. y11_signsq "My worker and I agree about what's best for my child(ren)"
+6. y16_signsq "My worker doesn't understand where I'm coming from at all" (Reverse Coded)
+7. y19_signsq "My worker is helping me plan so I can prevent problems in the future"
+
+
+```{r bma_stuff}
+
+library(nnet)
+library(simcf)
+library(MASS)
+library(BMA)
+
+
+#get rid of "unobserved outcomes" and rename
+dat3$outcome <- as.factor(as.character(dat3$outcome)) 
+levels(dat3$outcome) <- c("Adoption", "Emancipation", "Guardianship", "Reunification")
+
+dat3$outcome_rl <- relevel(dat3$outcome, ref = "Emancipation")
+
+dat3$outcome_rl_num <- as.numeric(dat3$outcome_rl)
+
+dat3 <- cbind(dat3
+              ,var_tx_tern
+              ,var_tx_sgnsq
+              ,var_tx_sgnsqrt
+              ,var_tx_lin)
+
+
+dat3_naom <- dat3[,c("outcome_rl_num"
+                      ,"emc_s"
+                      ,"reu_s"
+                      ,"adt_s"
+                      ,"gdn_s"
+                      ,"log_age_eps_begin"
+                      ,"non_min"
+                      ,"male"
+                      ,"par_age"
+                      ,"married"
+                      ,"hhnum_c"
+                      ,"rel_plc"
+                      ,"log_eps_rank"
+                      ,"housing_hs_cnt"
+                      ,"high_in"
+                      ,"sm_coll"
+                      ,"employ"
+                      ,"y5_signsq"
+                      ,"y6_signsq"
+                      ,"y9_signsq"
+                      ,"y10_tern"
+                      ,"y11_signsq"
+                      ,"y16_signsq"
+                      ,"y19_signsq")]
+
+dat3_naom <- na.omit(dat3_naom)
+
+m1.emc <- bic.glm(emc_s ~ #child char
+                          log_age_eps_begin +
+                          non_min +
+                          male +
+                          #parent char
+                          par_age +
+                          married +
+                          hhnum_c +
+                          rel_plc +
+                          log_eps_rank +
+                          housing_hs_cnt +
+                          high_in +
+                          sm_coll +
+                          employ +
+                          y5_signsq +
+                          y6_signsq +
+                          y9_signsq +
+                          y10_tern +
+                          y11_signsq +
+                          y16_signsq +
+                          y19_signsq
+                      ,data = dat3_naom
+                      ,glm.family = "binomial")
+
+summary(m1.emc)
+imageplot.bma(m1.emc)
+
+m1.adt <- bic.glm(adt_s ~ #child char
+                          log_age_eps_begin +
+                          non_min +
+                          male +
+                          #parent char
+                          par_age +
+                          married +
+                          hhnum_c +
+                          rel_plc +
+                          log_eps_rank +
+                          housing_hs_cnt +
+                          high_in +
+                          sm_coll +
+                          employ +
+                          y5_signsq +
+                          y6_signsq +
+                          y9_signsq +
+                          y10_tern +
+                          y11_signsq +
+                          y16_signsq +
+                          y19_signsq
+                      ,data = dat3_naom
+                      ,glm.family = "binomial")
+
+summary(m1.adt)
+imageplot.bma(m1.adt)
+
+m1.gdn <- bic.glm(gdn_s ~ #child char
+                          log_age_eps_begin +
+                          non_min +
+                          male +
+                          #parent char
+                          par_age +
+                          married +
+                          hhnum_c +
+                          rel_plc +
+                          log_eps_rank +
+                          housing_hs_cnt +
+                          high_in +
+                          sm_coll +
+                          employ +
+                          y5_signsq +
+                          y6_signsq +
+                          y9_signsq +
+                          y10_tern +
+                          y11_signsq +
+                          y16_signsq +
+                          y19_signsq
+                      ,data = dat3_naom
+                      ,glm.family = "binomial")
+
+summary(m1.gdn)
+imageplot.bma(m1.gdn)
+
+m1.reu <- bic.glm(reu_s ~ #child char
+                          log_age_eps_begin +
+                          non_min +
+                          male +
+                          #parent char
+                          par_age +
+                          married +
+                          hhnum_c +
+                          rel_plc +
+                          log_eps_rank +
+                          housing_hs_cnt +
+                          high_in +
+                          sm_coll +
+                          employ +
+                          y5_signsq +
+                          y6_signsq +
+                          y9_signsq +
+                          y10_tern +
+                          y11_signsq +
+                          y16_signsq +
+                          y19_signsq
+                      ,data = dat3_naom
+                      ,glm.family = "binomial")
+
+summary(m1.reu)
+imageplot.bma(m1.reu)
+
+m1 <- multinom(outcome_rl ~ #child char
+                                  log_age_eps_begin +
+                                  #parent char
+                                  par_age +
+                                  #log_par_age +
+                                  married +
+                                  hhnum_c +
+                                  rel_plc +
+                                  housing_hs_cnt +
+                                  high_in +
+                                  sm_coll +
+                                  employ +
+                                  y6_signsq +
+                                  y11_signsq 
+                                  #y19_signsq
+                           ,data = dat3
+                           ,Hess = TRUE)
+summary(m1)
+
+z <- summary(m1)$coefficients/summary(m1)$standard.errors
+p <- (1 - pnorm(abs(z), 0, 1)) * 2
+
+#extract params
+pe <- m1$wts[c(15:26,28:39,41:52)]
+
+#run the multinomial model
+vc <- solve(m1$Hess) 
+
+#load a package which contains a multivariate normal 
+#sampling function
+require(MASS)
+#assign a variable for the number of simulations
+sims <- 10000
+#draw the indicates number of beta simulates 
+#using our extracted model data
+simbetas <- mvrnorm(sims,pe,vc)
+
+simb <- array(NA, dim = c(sims,12,3))
+simb[,,1] <- simbetas[,1:12]         
+simb[,,2] <- simbetas[,13:24]
+simb[,,3] <- simbetas[,25:36]
+
+agerange <- seq(0,2.89,by=0.01)    
+
+xhyp <- cfFactorial(log_age_eps_begin = agerange
+                    ,par_age = mean(dat3$par_age)
+                    ,married = mean(dat3$married)
+                    ,hhnum_c = mean(dat3$hhnum_c)
+                    ,rel_plc = mean(dat3$rel_plc)
+                    ,housing_hs_cnt = mean(dat3$housing_hs_cnt)
+                    ,high_in = mean(dat3$high_in, na.rm = TRUE)
+                    ,sm_coll = mean(dat3$sm_coll, na.rm = TRUE)
+                    ,employ = mean(dat3$employ)
+                    ,y6_signsq = mean(dat3$y6_signsq)
+                    #,y19_signsq = mean(dat3$y19_signsq, na.rm = TRUE)
+                    ,y11_signsq = mean(dat3$y11_signsq, na.rm = TRUE)                          
+                    #,y19_signsq = mean(dat3$y19_signsq, na.rm = TRUE)
+                    )   
+                    
+test_sims <- mlogitsimev(xhyp,simb,ci=0.95,constant=1)
+
+y <- as.vector(test_sims$pe[,1:4])
+
+x <- rep(1:length(agerange), 4)
+
+lower <- as.vector(test_sims$lower[,1:4,])
+
+upper <- as.vector(test_sims$upper[,1:4,])
+
+Outcome <- c(rep("Adoption", length(agerange))
+                 ,rep("Guardianship"
+                      ,length(agerange))
+                 ,rep("Reunification"
+                      ,length(agerange))
+                 ,rep("Emancipation"
+                      ,length(agerange)))
+
+dat_sim_plot1 <- data.frame(y,x,lower,upper,Outcome)
+
+library(pocr)
+
+age_plot <- ggplot(dat_sim_plot1
+       ,aes(x=exp(x*.01), y=y, group=Outcome)) + 
+        geom_line(size=1, alpha=.5) +
+        geom_ribbon(aes(ymin=lower
+                        ,ymax=upper
+                        ,fill=Outcome), alpha=.5) +
+        ylab(expression(paste("Pr(Outcome | Age, ", italic("Ceteris Paribus"), ")"))) +
+        xlab("Age at Entry into Foster Care") +
+        labs(fill="") +
+        annotate(geom = "text"
+                  ,x = 2
+                  ,y = .75
+                  ,label = "Reunification"
+                  ,colour=portal_colors[8]
+                  ,size=20) + 
+        annotate(geom = "text"
+                  ,x = 4
+                  ,y = .35
+                  ,label = "Adoption"
+                  ,colour=portal_colors[5]
+                  ,size=20) + 
+        annotate(geom = "text"
+                  ,x = 2
+                  ,y = .15
+                  ,label = "Guardianship"
+                  ,colour=portal_colors[7]
+                  ,size=20) + 
+        annotate(geom = "text"
+                  , x = 13
+                  , y = .85
+                  , label = "Emancipation"
+                  , colour=portal_colors[6]
+                  , size=20) +  
+        scale_fill_manual(values=portal_colors[5:8], guide=FALSE) +
+        theme_bw() +
+        theme(legend.position="bottom"
+              ,axis.text=element_text(size=35)
+              ,axis.title=element_text(size=41, vjust=0.1)
+              ,axis.ticks.length = unit(1, "cm"))
+
+age_plot
+
+#set up y11 plot
+
+xhyp[[1]]$log_age_eps_begin <- mean(dat3$log_age_eps_begin)
+xhyp[[1]]$y11_signsq <- seq(-4,4,by=8/289)
+
+xhyp[[2]]$log_age_eps_begin <- mean(dat3$log_age_eps_begin)
+xhyp[[2]]$y11_signsq <- seq(-4,4,by=8/289)
+
+
+test_sims <- mlogitsimev(xhyp,simb,ci=0.95,constant=1)
+
+y <- as.vector(test_sims$pe[,1:4])
+
+x <- rep(seq(from = -4, to = 4, length.out = 290), 4)
+
+lower <- as.vector(test_sims$lower[,1:4,])
+
+upper <- as.vector(test_sims$upper[,1:4,])
+
+Outcome <- c(rep("Adoption", length(agerange))
+                 ,rep("Guardianship"
+                      ,length(agerange))
+                 ,rep("Reunification"
+                      ,length(agerange))
+                 ,rep("Emancipation"
+                      ,length(agerange)))
+
+dat_sim_plot2 <- data.frame(y,x,lower,upper,Outcome)
+
+
+y11_plot <- ggplot(dat_sim_plot2
+       ,aes(x=x, y=y, group=Outcome)) + 
+        geom_line(size=1, alpha=.5) +
+        geom_ribbon(aes(ymin=lower
+                        ,ymax=upper
+                        ,fill=Outcome), alpha=.5) +
+        ylab(expression(paste("Pr(Outcome | Engagement, ", italic("Ceteris Paribus"), ")"))) +
+        xlab("My worker and I agree about what's best for my child(ren)") +
+        scale_x_continuous(limits=c(-4,4)
+                         ,labels = c("Strongly Agree","","Not Sure","","Strongly Disagree")) +
+        labs(fill="") +
+        annotate(geom = "text"
+                  ,x = 2
+                  ,y = .75
+                  ,label = "Reunification"
+                  ,colour=portal_colors[8]
+                  ,size=20) + 
+        annotate(geom = "text"
+                  ,x = -1
+                  ,y = .35
+                  ,label = "Adoption"
+                  ,colour=portal_colors[5]
+                  ,size=20) + 
+        annotate(geom = "text"
+                  ,x = 2
+                  ,y = .15
+                  ,label = "Guardianship"
+                  ,colour=portal_colors[7]
+                  ,size=20) + 
+#         annotate(geom = "text"
+#                   ,x = 13
+#                   ,y = .85
+#                   ,label = "Emancipation"
+#                   ,colour=portal_colors[6]
+#                   ,size=20) +  
+        scale_fill_manual(values=portal_colors[5:8], guide=FALSE) +
+        theme_bw() +
+        theme(legend.position="bottom"
+              ,axis.text=element_text(size=35)
+              ,axis.title=element_text(size=41, vjust=0.1)
+              ,axis.ticks.length = unit(1, "cm"))
+
+y11_plot
+
+
+
+#set up housing plot
+xhyp[[1]]$y11_signsq <- mean(dat3$y11_signsq, na.rm=TRUE)
+xhyp[[1]]$housing_hs_cnt <- seq(0,5,length.out = 290)
+
+xhyp[[2]]$y11_signsq <- mean(dat3$y11_signsq, na.rm=TRUE)
+xhyp[[2]]$housing_hs_cnt <- seq(0,5,length.out = 290)
+
+test_sims <- mlogitsimev(xhyp,simb,ci=0.95,constant=1)
+
+y <- as.vector(test_sims$pe[,1:4])
+
+x <- rep(seq(0,5,length.out = 290), 4)
+
+lower <- as.vector(test_sims$lower[,1:4,])
+
+upper <- as.vector(test_sims$upper[,1:4,])
+
+Outcome <- c(rep("Adoption", length(agerange))
+                 ,rep("Guardianship"
+                      ,length(agerange))
+                 ,rep("Reunification"
+                      ,length(agerange))
+                 ,rep("Emancipation"
+                      ,length(agerange)))
+
+dat_sim_plot3 <- data.frame(y,x,lower,upper,Outcome)
+
+housing_plot <- ggplot(dat_sim_plot3
+       ,aes(x=x, y=y, group=Outcome)) + 
+        geom_line(size=1, alpha=.5) +
+        geom_ribbon(aes(ymin=lower
+                        ,ymax=upper
+                        ,fill=Outcome), alpha=.5) +
+        ylab(expression(paste("Pr(Outcome | Housing, ", italic("Ceteris Paribus"), ")"))) +
+        xlab("Count of Housing Hardships") +
+        labs(fill="") +
+        annotate(geom = "text"
+                  ,x = 2.5
+                  ,y = .75
+                  ,label = "Reunification"
+                  ,colour=portal_colors[8]
+                  ,size=20) + 
+        annotate(geom = "text"
+                  ,x = 1
+                  ,y = .35
+                  ,label = "Adoption"
+                  ,colour=portal_colors[5]
+                  ,size=20) + 
+        annotate(geom = "text"
+                  ,x = 2
+                  ,y = .16
+                  ,label = "Guardianship"
+                  ,colour=portal_colors[7]
+                  ,size=20) + 
+#         annotate(geom = "text"
+#                   ,x = 13
+#                   ,y = .85
+#                   ,label = "Emancipation"
+#                   ,colour=portal_colors[6]
+#                   ,size=20) +  
+        scale_fill_manual(values=portal_colors[5:8], guide=FALSE) +
+        theme_bw() +
+        theme(legend.position="bottom"
+              ,axis.text=element_text(size=35)
+              ,axis.title=element_text(size=41, vjust=0.1)
+              ,axis.ticks.length = unit(1, "cm"))
+
+housing_plot
+
+#set up housing by employment plot (no problem)
+xhyp[[1]]$employ <- 0
+
+xhyp[[2]]$employ <- 0
+
+
+test_sims <- mlogitsimev(xhyp,simb,ci=0.95,constant=1,)
+
+y <- as.vector(test_sims$pe[,1:4])
+
+x <- rep(seq(0,5,length.out = 290), 4)
+
+lower <- as.vector(test_sims$lower[,1:4,])
+
+upper <- as.vector(test_sims$upper[,1:4,])
+
+Outcome <- c(rep("Adoption", length(agerange))
+                 ,rep("Guardianship"
+                      ,length(agerange))
+                 ,rep("Reunification"
+                      ,length(agerange))
+                 ,rep("Emancipation"
+                      ,length(agerange)))
+
+dat_sim_plot_no_prob <- data.frame(y,x,lower,upper,Outcome)
+
+#set up housing by employment plot (problem)
+xhyp[[1]]$employ <- 1
+
+xhyp[[2]]$employ <- 1
+
+test_sims <- mlogitsimev(xhyp,simb,ci=0.95,constant=1,)
+
+y <- as.vector(test_sims$pe[,1:4])
+
+x <- rep(seq(0,5,length.out = 290), 4)
+
+lower <- as.vector(test_sims$lower[,1:4,])
+
+upper <- as.vector(test_sims$upper[,1:4,])
+
+Outcome <- c(rep("Adoption", length(agerange))
+                 ,rep("Guardianship"
+                      ,length(agerange))
+                 ,rep("Reunification"
+                      ,length(agerange))
+                 ,rep("Emancipation"
+                      ,length(agerange)))
+
+dat_sim_plot_prob <- data.frame(y,x,lower,upper,Outcome)
+
+dat_sim_plot4 <- rbind(dat_sim_plot_prob, dat_sim_plot_no_prob)
+dat_sim_plot4$emp <- rep(c("Employment Problem"
+                          ,"No Employment Problem")
+                          ,each = nrow(dat_sim_plot_prob))
+
+
+housing_plot_plus_emp <- ggplot(dat_sim_plot4
+       ,aes(x=x, y=y, group=Outcome)) + 
+        geom_line(size=1, alpha=.5) +
+        geom_ribbon(aes(ymin=lower
+                        ,ymax=upper
+                        ,fill=Outcome), alpha=.5) +
+        facet_grid(~emp) +
+        scale_fill_manual(values=portal_colors[5:8]) +
+        ylab(expression(paste("Pr(Outcome | Housing, Employment, ", italic("Ceteris Paribus"), ")"))) +
+        xlab("Count of Housing Hardships") +
+        labs(fill="") +
+        annotate(geom = "text"
+                  ,x = 2.5
+                  ,y = .75
+                  ,label = "Reunification"
+                  ,colour=portal_colors[8]
+                  ,size=20) + 
+        annotate(geom = "text"
+                  ,x = 1
+                  ,y = .35
+                  ,label = "Adoption"
+                  ,colour=portal_colors[5]
+                  ,size=20) + 
+        annotate(geom = "text"
+                  ,x = 2
+                  ,y = .16
+                  ,label = "Guardianship"
+                  ,colour=portal_colors[7]
+                  ,size=20) + 
+#         annotate(geom = "text"
+#                   ,x = 13
+#                   ,y = .85
+#                   ,label = "Emancipation"
+#                   ,colour=portal_colors[6]
+#                   ,size=20) +  
+        scale_fill_manual(values=portal_colors[5:8], guide=FALSE) +
+        theme_bw() +
+        theme(legend.position="bottom"
+              ,axis.text=element_text(size=35)
+              ,axis.title=element_text(size=41, vjust=0.1)
+              ,axis.ticks.length = unit(1, "cm")
+              ,strip.background = element_rect(fill = NA, colour = NA)
+              ,strip.text.x =     element_text(colour = "black", size = 35)
+              )
+
+
+housing_plot_plus_emp
+
+#set up housing by eucation plot (some college)
+xhyp[[1]]$sm_coll <- 1
+
+xhyp[[2]]$sm_coll <- 1
+
+xhyp[[1]]$employ <- mean(dat3$employ, na.rm=TRUE)
+
+xhyp[[2]]$employ <- mean(dat3$employ, na.rm=TRUE)
+
+test_sims <- mlogitsimev(xhyp,simb,ci=0.95,constant=1,)
+
+y <- as.vector(test_sims$pe[,1:4])
+
+x <- rep(seq(0,5,length.out = 290), 4)
+
+lower <- as.vector(test_sims$lower[,1:4,])
+
+upper <- as.vector(test_sims$upper[,1:4,])
+
+Outcome <- c(rep("Adoption", length(agerange))
+                 ,rep("Guardianship"
+                      ,length(agerange))
+                 ,rep("Reunification"
+                      ,length(agerange))
+                 ,rep("Emancipation"
+                      ,length(agerange)))
+
+dat_sim_plot_no_prob <- data.frame(y,x,lower,upper,Outcome)
+
+#set up housing by education plot (no college)
+xhyp[[1]]$sm_coll <- 0
+
+xhyp[[2]]$sm_coll <- 0
+
+
+test_sims <- mlogitsimev(xhyp,simb,ci=0.95,constant=1,)
+
+y <- as.vector(test_sims$pe[,1:4])
+
+x <- rep(seq(0,5,length.out = 290), 4)
+
+lower <- as.vector(test_sims$lower[,1:4,])
+
+upper <- as.vector(test_sims$upper[,1:4,])
+
+Outcome <- c(rep("Adoption", length(agerange))
+                 ,rep("Guardianship"
+                      ,length(agerange))
+                 ,rep("Reunification"
+                      ,length(agerange))
+                 ,rep("Emancipation"
+                      ,length(agerange)))
+
+dat_sim_plot_prob <- data.frame(y,x,lower,upper,Outcome)
+
+dat_sim_plot5 <- rbind(dat_sim_plot_prob, dat_sim_plot_no_prob)
+dat_sim_plot5$coll <- rep(c("No College"
+                          ,"Some College")
+                          ,each = nrow(dat_sim_plot_prob))
+
+
+housing_plot_plus_coll <- ggplot(dat_sim_plot5
+       ,aes(x=x, y=y, group=Outcome)) + 
+        geom_line(size=1, alpha=.5) +
+        geom_ribbon(aes(ymin=lower
+                        ,ymax=upper
+                        ,fill=Outcome), alpha=.5) +
+        facet_grid(~coll) +
+        scale_fill_manual(values=portal_colors[5:8]) +
+        ylab(expression(paste("Pr(Outcome | Housing, Education, ", italic("Ceteris Paribus"), ")"))) +
+        xlab("Count of Housing Hardships") +
+        labs(fill="") +
+        annotate(geom = "text"
+                  ,x = 2.5
+                  ,y = .75
+                  ,label = "Reunification"
+                  ,colour=portal_colors[8]
+                  ,size=20) + 
+        annotate(geom = "text"
+                  ,x = 1
+                  ,y = .35
+                  ,label = "Adoption"
+                  ,colour=portal_colors[5]
+                  ,size=20) + 
+        annotate(geom = "text"
+                  ,x = 2
+                  ,y = .16
+                  ,label = "Guardianship"
+                  ,colour=portal_colors[7]
+                  ,size=20) + 
+#         annotate(geom = "text"
+#                   ,x = 13
+#                   ,y = .85
+#                   ,label = "Emancipation"
+#                   ,colour=portal_colors[6]
+#                   ,size=20) +  
+        scale_fill_manual(values=portal_colors[5:8], guide=FALSE) +
+        theme_bw() +
+        theme(legend.position="bottom"
+              ,axis.text=element_text(size=35)
+              ,axis.title=element_text(size=41, vjust=0.1)
+              ,axis.ticks.length = unit(1, "cm")
+              ,strip.background = element_rect(fill = NA, colour = NA)
+              ,strip.text.x =     element_text(colour = "black", size = 35)
+              )
+
+housing_plot_plus_coll
+
+
+#set up housing by education by Emp plot
+
+xhyp[[1]]$sm_coll <- 1
+xhyp[[2]]$sm_coll <- 1
+
+xhyp[[1]]$employ <- 0
+xhyp[[2]]$employ <- 0
+
+
+test_sims <- mlogitsimev(xhyp,simb,ci=0.95,constant=1,)
+
+y <- as.vector(test_sims$pe[,1:4])
+
+x <- rep(seq(0,5,length.out = 290), 4)
+
+lower <- as.vector(test_sims$lower[,1:4,])
+
+upper <- as.vector(test_sims$upper[,1:4,])
+
+Outcome <- c(rep("Adoption", length(agerange))
+                 ,rep("Guardianship"
+                      ,length(agerange))
+                 ,rep("Reunification"
+                      ,length(agerange))
+                 ,rep("Emancipation"
+                      ,length(agerange)))
+
+dat_sim_plot6 <- data.frame(y,x,lower,upper,Outcome)
+
+housing_plot_plus_coll_plus_emp <- ggplot(dat_sim_plot6
+       ,aes(x=x, y=y, group=Outcome)) + 
+        geom_line(size=1, alpha=.5) +
+        geom_ribbon(aes(ymin=lower
+                        ,ymax=upper
+                        ,fill=Outcome), alpha=.5) +
+        scale_fill_manual(values=portal_colors[5:8]) +
+        ylab(expression(paste("Pr(Outcome | Housing, Some College, No Employment Problem, ", italic("Ceteris Paribus"), ")"))) +
+        xlab("Count of Housing Hardships") +
+        labs(fill="") +
+        annotate(geom = "text"
+                  ,x = 4
+                  ,y = .83
+                  ,label = "Reunification"
+                  ,colour=portal_colors[8]
+                  ,size=20) + 
+        annotate(geom = "text"
+                  ,x = 3
+                  ,y = .35
+                  ,label = "Adoption"
+                  ,colour=portal_colors[5]
+                  ,size=20) + 
+        annotate(geom = "text"
+                  ,x = 4
+                  ,y = .05
+                  ,label = "Guardianship"
+                  ,colour=portal_colors[7]
+                  ,size=20) + 
+#         annotate(geom = "text"
+#                   ,x = 13
+#                   ,y = .85
+#                   ,label = "Emancipation"
+#                   ,colour=portal_colors[6]
+#                   ,size=20) +  
+        scale_fill_manual(values=portal_colors[5:8], guide=FALSE) +
+        theme_bw() +
+        theme(legend.position="bottom"
+              ,axis.text=element_text(size=35)
+              ,axis.title=element_text(size=41, vjust=0.1)
+              ,axis.ticks.length = unit(1, "cm")
+              ,strip.background = element_rect(fill = NA, colour = NA)
+              ,strip.text.x =     element_text(colour = "black", size = 35)
+              )
+
+
+housing_plot_plus_coll_plus_emp
+ 
+```
+
+
+
+```{r send to pptx}
+library(ReporteRs)
+
+numbering.pattern = c( "%1.", "%1. %2.", "%1. %2. %3.", 
+  "%4.", "%5.", "%6.", "%7.", "%8.", "%9." )
+
+ordered.formats = rep( c( "decimal", "upperRoman", "upperLetter"), 3 )
+
+unordered.formats = rep( c( "square", "disc", "circle"), 3 )
+
+left.indent = seq( from = 0, by = 0.5, length.out = 9)
+
+# use D:/docs/template/my_corporate_template.pptx as template
+doc = pptx(template = 'power_point_template.pptx')
+
+# check my layout names:
+slide.layouts(doc)
+
+doc = addSlide(doc, slide.layout = "Content No Title" )
+#doc = addTitle(doc, "Effects of Age")
+doc = addPlot( doc, function( ) print( age_plot ))
+
+doc = addSlide(doc, slide.layout = "Content No Title" )
+#doc = addTitle(doc, "Effects of Age")
+doc = addPlot( doc, function( ) print( y11_plot ))
+
+
+doc = addSlide(doc, slide.layout = "Content No Title" )
+#doc = addTitle(doc, "Effects of Age")
+doc = addPlot( doc, function( ) print( housing_plot ))
+
+doc = addSlide(doc, slide.layout = "Content No Title" )
+#doc = addTitle(doc, "Effects of Age")
+doc = addPlot( doc, function( ) print( housing_plot_plus_emp ))
+
+doc = addSlide(doc, slide.layout = "Content No Title" )
+#doc = addTitle(doc, "Effects of Age")
+doc = addPlot( doc, function( ) print( housing_plot_plus_coll ))
+
+doc = addSlide(doc, slide.layout = "Content No Title" )
+#doc = addTitle(doc, "Effects of Age")
+doc = addPlot( doc, function( ) print( housing_plot_plus_coll_plus_emp ))
+
+writeDoc(doc, file = "ps_redux_v1_gregor.pptx")
+
+
+```
+
+# Bibliography
+```{r bibliography, results='asis'}
+bibliography()
+```
+
