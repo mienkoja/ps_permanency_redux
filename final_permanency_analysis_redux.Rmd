@@ -1,0 +1,1207 @@
+---
+title: "The Relationship Between Parental Engagement and Child Welfare Permanency Outcomes"
+author: "To Be Determined Authorship"
+date: "June 18, 2015"
+output: word_document
+bibliography: final_permanency_analysis_redux.bib
+---
+
+# Introduction and Background 
+During the last half of the 20th century, the US child welfare system evolved from a system focused almost exclusively on the safety of children to a system which balances safety concerns with a desire to preserve existing family units. This evolution is embodied in federal statute under Title IV-B(2) of the Social Security Act which authorizes the Promoting Safe and Stable Families (PSSF) Program. Since 1993 this program has provided federal funds to states in order to offer system-involved families with Family Support Services, Family Preservation Services, and Time-Limited Family Reunification Services. 
+
+As a means of implementing PSSF and related pieces of federal and state law, social work case management strategies in the child welfare system have also evolved to focus more deliberately on parental engagement in case planning and assessment activities. In Washington State, since 2008, the child welfare agency has specifically promoted the use of Solution Based Casework (SBC) a case management strategy with a strong emphasis on parent engagement [@PipkinEtAl2013]. SBC and other engagement-focused modes of social work case management acknowledge that since parents play such a large role in case outcomes, parents should be active participants in the management of their case plans. 
+
+While there is a wealth of literature establishing a need for parental engagement in the context of the child welfare system [e.g. @KempEtAl2009], the empirical evidence linking parental engagement to case outcomes in the child welfare system is sparse. @Cheng2010 conducted an analysis of data from the National Survey of Child and Adolescent Well-being (NSCAW). Using a simple summation of Likert responses to NSCAW items concerning worker perceptions of their relationships with the family, the worker’s confidence that they had helped the family get needed services, and the worker’s confidence that they had helped the family achieve its goals as a measure of engagement, Cheng conducted a multinomial logistic regression analysis and found a positive relationship between engagement and the probability that a child would experience adoption or reunification as opposed to no outcome at all. However, Cheng’s analysis relied on worker perceptions of engagement. It is unclear how well worker perceptions of engagement relate to parental perceptions. Furthermore, Cheng’s analysis is limited to individuals in care for at least three years. Thus, it is unclear how well these results generalize to the rest of the child welfare population. 
+
+More recently, @MienkoEtAl2012 conducted an event history analysis of a representative sample of parents entering the child welfare system in Washington State for the first time in late 2007. The results of the analysis indicate that parental engagement was positively associated with the mean Likert score of the @Yatchmenoff2005 engagement measurement (YEM). This study allows for more generalizability than the @Cheng2010 analysis in that the study focuses on all children in the out-of-home care population as opposed to long-stayers. This study also measures engagement on the basis of parental self-report as opposed to worker perceptions and properly accounts for the right-censoring that is typically present in analyses of child welfare system outcomes. However, this study only examines reunification; one of many permanency outcomes. As parental engagement may have different effects on different permanency outcomes, it would be helpful to examine the effects of engagement across all possible permanency outcomes simultaneously. 
+
+This study seeks to provide a comprehensive empirical examination of the relationship between parental engagement and permanency outcomes in the child welfare system. The study takes advantage of a unique set of population-based survey data involving the YEM and several other items linked to administrative data records. The authors hypothesize that higher YEM scores will be related to higher probabilities of reunification and lower probabilities of adoption and guardianship. As children who emancipate or "age-out" of the child welfare system typically enter care for behavioral reasons, we hypothesize no significant relationship between YEM scores and the child’s probability of emancipation.
+
+# Methods
+
+```{r preliminary, include=FALSE}
+#load the RODBC library
+library(RODBC)
+#loan nnet for multinom function 
+library(nnet)
+#load lubridate to handle dates
+library(lubridate)
+#load pysch to calculate factor scores 
+library(psych)
+#load to select covariates 
+library(BMA)
+#prepaer pretty tables
+library(xtable)
+#load for summary statistics by outcomes 
+library(sqldf)
+#load for kable function
+library(knitr)
+#load for rmvnorm
+library(MASS)
+#load for simulation functions
+library(simcf)
+#load for plot functions
+library(ggplot2)
+
+```
+
+
+```{r select_overall, tidy=FALSE, cache=TRUE, warning=FALSE, include=FALSE}
+#assign a connection object
+cn <- odbcConnect("POC")
+
+#use the connection object to send a query to our database
+dat1 <- sqlQuery(cn, 
+"
+select 
+    *
+    ,id_prsn_child
+from poc_survey.ps_tbl_parent_data tpd
+    join poc_survey.ps_tbl_children tc
+    on tpd.dcid=tc.dcid")
+
+#count the number of parents
+dat1_par <- length(unique(dat1$DCID))
+
+#count the number of children
+dat1_chi <- length(unique(dat1$id_prsn_child))
+
+dat2 <- sqlQuery(cn, "
+with child_rem_id as
+(
+select
+    tpd.dcid
+    ,tc.id_prsn_child
+    ,min(id_removal_episode_fact) id_removal_episode_fact
+from poc_survey.ps_tbl_parent_data tpd
+	join poc_survey.ps_tbl_children tc
+		on tpd.dcid=tc.dcid
+	join base.rptPlacement vep
+		on vep.removal_dt <= tpd.intdate 
+			and vep.removal_dt >= dateadd(dd, -365, tpd.intdate)
+			and vep.child=tc.id_prsn_child
+group by 
+    tpd.dcid
+    ,tc.id_prsn_child
+)
+select distinct
+	cri.id_prsn_child
+    ,cri.id_removal_episode_fact 
+    --check for records of dependency from AOC data
+    --for any dependency date that takes place after permanency, set date to null
+    ,case 
+        when datediff(dd
+            ,isnull(vep.dependency_dt
+                    ,vep.removal_dt)
+					,isnull(case
+							when discharge_dt = '9999-12-31'
+							then null
+							when [18bday] < discharge_dt and discharge_dt != '9999-12-31'
+							then [18bday]
+							else discharge_dt
+							end --this case statement calculates earlier_of_eps_end_18th_bday
+					,'2014-12-31')) < 0
+        then null
+        else vep.dependency_dt
+    end dep_date
+    --calculate the timing of court involvement 
+    ,case 
+        --check for petitions before removal and set time to 0
+        when datediff(dd, vep.removal_dt, isnull(vep.dependency_dt, vep.removal_dt)) < 0 
+        then 0
+        --treat missing dependency dates (from logic above) with dur_days 
+		--greater than 365 as immediate dependencies
+        when 
+			case 				
+        		when datediff(dd, isnull(vep.dependency_dt, vep.removal_dt)
+                    ,isnull(case
+								when discharge_dt = '9999-12-31'
+								then null
+								when [18bday] < discharge_dt and discharge_dt != '9999-12-31'
+								then [18bday]
+								else discharge_dt
+							end --this case statement calculates earlier_of_eps_end_18th_bday
+                    ,'2014-12-31')) < 0
+        		then null
+        		else vep.dependency_dt
+        	end is null 
+        	and dur_days > 365
+        then 0
+		--treat missing dependency dates with dur_days less than 365 as VPA cases
+		when 
+        	case 	
+        		when datediff(dd, isnull(vep.dependency_dt, vep.removal_dt)
+					,isnull(case
+								when discharge_dt = '9999-12-31'
+								then null
+								when [18bday] < discharge_dt and discharge_dt != '9999-12-31'
+								then [18bday]
+								else discharge_dt
+							end 
+							--this case statement calculates earlier_of_eps_end_18th_bday
+					,'2014-12-31')) < 0
+        			then null
+        			else vep.dependency_dt
+        	end is null 
+		then dur_days
+		--check for petitions after permanency and set time to episode duration
+		when datediff(dd
+						,vep.dependency_dt
+						,isnull(case
+									when discharge_dt = '9999-12-31'
+									then null
+									when [18bday] < discharge_dt and discharge_dt != '9999-12-31'
+									then [18bday]
+									else discharge_dt
+								end 
+								--this case statement calculates earlier_of_eps_end_18th_bday
+					,'2014-12-31')) < 0
+		then dur_days
+		--for all other cases just calculate the time from removal_dt to the AOC petition 
+		else datediff(dd, vep.removal_dt, isnull(vep.dependency_dt, vep.removal_dt))
+    end crt_t
+    ,case 
+        --check for petitions before removal and flag as court involvement
+        when datediff(dd
+						,vep.removal_dt
+						,isnull(case
+									when discharge_dt = '9999-12-31'
+									then null
+									when [18bday] < discharge_dt and discharge_dt != '9999-12-31'
+									then [18bday]
+									else discharge_dt
+								end 
+								--this case statement calculates earlier_of_eps_end_18th_bday
+								,'2014-12-31')) < 0
+        then 1
+        --treat missing dependency dates (from logic above) 
+		--with dur_days greater than 365 as immediate dependencies
+        when case 
+        		when datediff(dd, isnull(vep.dependency_dt, vep.removal_dt)
+                ,isnull(case
+							when discharge_dt = '9999-12-31'
+							then null
+							when [18bday] < discharge_dt and discharge_dt != '9999-12-31'
+							then [18bday]
+							else discharge_dt
+						end --this case statement calculates earlier_of_eps_end_18th_bday
+						,'2014-12-31')) < 0
+        		then null
+        		else vep.dependency_dt
+        	end is null 
+        	and dur_days > 365
+        then 1
+        --treat missing dependency dates with dur_days less than 365 as VPA cases
+        when 
+        	case 
+        		when datediff(dd
+								,vep.dependency_dt
+								,isnull(case
+											when discharge_dt = '9999-12-31'
+											then null
+											when [18bday] < discharge_dt and discharge_dt != '9999-12-31'
+											then [18bday]
+											else discharge_dt
+										end --this case statement calculates earlier_of_eps_end_18th_bday
+										,'2014-12-31')) < 0
+        		then null
+        		else vep.dependency_dt
+        	end is null 
+        then 0
+        --check for petitions after permanency and set time 
+		--to episode duration (effectively VPAs)
+        when datediff(dd
+						,vep.dependency_dt
+						,isnull(case
+									when discharge_dt = '9999-12-31'
+									then null
+									when [18bday] < discharge_dt and discharge_dt != '9999-12-31'
+									then [18bday]
+									else discharge_dt
+								end --this case statement calculates earlier_of_eps_end_18th_bday
+								,'2014-12-31')) < 0
+        then 0
+        --for all other cases just calculate the time from eps_begin to the AOC or CA petition 
+        else 1
+    end crt_s
+    ,dur_days reu_t
+    ,case
+        when dte.discharge_type = 'Reunification' then 1 else 0
+    end reu_s
+    ,dur_days adt_t
+    ,case
+        when dte.discharge_type = 'Adoption' then 1 else 0
+    end adt_s
+    ,dur_days gdn_t
+    ,case
+		when dte.discharge_type = 'Guardianship' then 1 else 0
+    end gdn_s
+  	,datediff(dd, vep.removal_dt, tpd.intdate) time_to_int
+    ,tpd.* 
+	  ,vep.*
+    --try to get rid of others by looking to last placement end reason 
+	  ,case
+      when last_end_rsn in ('Returned to Custody of Parents - Dependency Dismissed'
+                            ,'Voluntary Placement Agreement Ended - Return to Parent')
+      and dte.alt_discharge_type = 'Other'
+      then 'Reunification'
+      when exit_reason = 'Reunification'
+      then 'Reunification'
+      when exit_reason = 'Adoption'
+      then 'Adoption'
+      when exit_reason = 'Extended FC Services Ending'
+      then 'Emancipation'
+      when last_end_rsn = 'Reached Age of Majority'
+      and dte.alt_discharge_type = 'Other'
+      then 'Emancipation'
+      else dte.alt_discharge_type
+    end outcome 
+from poc_survey.ps_tbl_parent_data tpd
+    join child_rem_id cri
+        on tpd.dcid=cri.dcid
+	join base.rptPlacement vep 
+		on vep.id_removal_episode_fact = cri.id_removal_episode_fact
+	join dbo.ref_lookup_cd_discharge_type_exits dte
+		on dte.cd_discharge_type = vep.cd_discharge_type
+order by vep.id_removal_episode_fact
+")
+
+
+#count the number of parents
+dat2_par <- length(unique(dat2$DCID))
+
+
+#count the number of children
+dat2_chi <- length(unique(dat2$id_prsn_child))
+
+dat3 <- subset(dat2, !(dat2$outcome %in% c("Still In Care", "Other")) & dat2$crt_s == 1)
+
+
+#count the number of parents
+dat3_par <- length(unique(dat3$DCID))
+
+
+#count the number of children
+dat3_chi <- length(unique(dat3$id_prsn_child))
+
+
+#define factor based outcome with reunification as reference category 
+dat3$outcome <- as.factor(as.character(dat3$outcome)) 
+levels(dat3$outcome) <- c("Adoption", "Emancipation", "Guardianship", "Reunification")
+dat3$outcome <- relevel(dat3$outcome, ref = "Reunification")
+
+#prep covariates
+#recode month-based age to years 
+dat3$age_eps_begin <- dat3$age_at_removal_mos/12
+#log transform age at episode begin
+dat3$log_age_eps_begin <- log1p(dat3$age_eps_begin)
+#flag for adolescent child
+dat3$ad_chld <- ifelse(dat3$age_eps_begin > 11, 1, 0)  
+#flag for toddler
+dat3$sm_chld <- ifelse(dat3$age_eps_begin <= 3, 1, 0) 
+#flag for white
+dat3$non_min <- ifelse(dat3$cd_race_census == 5, 1, 0)
+#flag for male
+dat3$male <- ifelse(dat3$cd_gndr == "M", 1, 0)
+#flag for parent age
+dat3$par_age <- year(strptime(dat3$removal_dt, format = "%Y-%m-%d"))-year(strptime(dat3$DOB, format = "%Y-%m-%d"))
+#flag for log transformed parent age
+dat3$log_par_age <- log(dat3$par_age)
+#flag for marriage status
+dat3$married <- ifelse(dat3$MARSTAT < 1, NA, ifelse(dat3$MARSTAT == 2, 1, 0))
+#count of Number of biological or adopted children
+dat3$hhnum_c <- ifelse(dat3$CHTOTNUM < 1, NA, dat3$CHTOTNUM)
+#flag for longest placement in relative setting 
+dat3$rel_plc <- ifelse(as.numeric(dat3$long_cd_plcm_setng)==6,1,0)
+#sequence of placement episode
+dat3$eps_rank <- dat3$child_eps_rank
+#log transform of sequence of placement episode
+dat3$log_eps_rank <- log(dat3$eps_rank)
+#total housing hardship count 
+dat3$housing_hs_cnt <- ifelse(is.na(dat3$LACRENT) == TRUE | dat3$LACRENT == 2, 0, 1) +
+                        ifelse(is.na(dat3$EVICT) == TRUE | dat3$EVICT == 2, 0, 1) + 
+                        ifelse(is.na(dat3$FAMFRND) == TRUE | dat3$FAMFRND == 2, 0, 1) + 
+                        ifelse(is.na(dat3$REPOSS) == TRUE | dat3$REPOSS == 2, 0, 1) + 
+                        ifelse(is.na(dat3$HOMLSS) == TRUE | dat3$HOMLSS == 2, 0, 1) 
+#flag for housing hardship
+dat3$hsg_hds <- ifelse(dat3$housing_hs_cnt > 0, 1, 0)
+#flag for income over 10,000K
+dat3$high_in <- ifelse(dat3$THHINC < 1, NA, ifelse(dat3$THHINC > 1, 1, 0))
+#flag for more than high school
+dat3$sm_coll <- ifelse(dat3$EDULVL < 1, NA, ifelse(dat3$EDULVL > 3, 1, 0))
+#flag for full or part time employment 
+dat3$employ <- ifelse(dat3$EMPSTAT < 1, NA, ifelse(dat3$EMPSTAT != 1, 1, 0))
+
+
+#engagement recoding 
+
+#first step is to recode responses to likert or NA only (dont know or refuse are all NA)
+
+#receptivity
+dat3$y2 = ifelse(dat3$YENG2 < 1, NA, dat3$YENG2)
+dat3$y3 = ifelse(dat3$YENG3 < 1, NA, dat3$YENG3)
+dat3$y7 = ifelse(dat3$YENG7 < 1, NA, dat3$YENG7)
+dat3$y15 = ifelse(dat3$YENG15 < 1, NA, dat3$YENG15)
+
+#working relationship
+dat3$y5 = ifelse(dat3$YENG5 < 1, NA, dat3$YENG5)
+dat3$y9 = ifelse(dat3$YENG9 < 1, NA, dat3$YENG9)
+dat3$y11 = ifelse(dat3$YENG11 < 1, NA, dat3$YENG11)
+dat3$y16 = ifelse(dat3$YENG16 < 1, NA, dat3$YENG16)
+
+#mistrust 
+dat3$y6 = ifelse(dat3$YENG6 < 1, NA, dat3$YENG6)
+dat3$y12 = ifelse(dat3$YENG12 < 1, NA, dat3$YENG12)
+dat3$y18 = ifelse(dat3$YENG18 < 1, NA, dat3$YENG18)
+
+#buyin  
+dat3$y1 = ifelse(dat3$YENG1 < 1, NA, dat3$YENG1)
+dat3$y4 = ifelse(dat3$YENG4 < 1, NA, dat3$YENG4)
+dat3$y8 = ifelse(dat3$YENG8 < 1, NA, dat3$YENG8)
+dat3$y10 = ifelse(dat3$YENG10 < 1, NA, dat3$YENG10)
+dat3$y13 = ifelse(dat3$YENG13 < 1, NA, dat3$YENG13)
+dat3$y14 = ifelse(dat3$YENG14 < 1, NA, dat3$YENG14)
+dat3$y17 = ifelse(dat3$YENG17 < 1, NA, dat3$YENG17)
+dat3$y19 = ifelse(dat3$YENG19 < 1, NA, dat3$YENG19)
+
+#next step is to calculate factor scores on the basis of the hypothetical factor structure of Yatchmenoff, 2005
+#note that indices are hard coded. if columns are added prior to this beyond those already coded, we will need to update the column indices accordingly
+#calculate factor scores
+library(psych)
+
+dat_recep <- dat3[,c("y2", "y3", "y7", "y15")]
+dat_recep_scores <- fa.poly(dat_recep)
+dat3$recep_scores <- as.numeric(dat_recep_scores$scores$scores)
+
+dat_wrkg <- dat3[,c("y5", "y9", "y11", "y16")]
+dat_wrkg_scores <- fa.poly(dat_wrkg)
+dat3$wrkg_scores <- as.numeric(dat_wrkg_scores$scores$scores)
+
+dat_mist <- dat3[,c("y6", "y12", "y18")]
+dat_mist_scores <- fa.poly(dat_mist)
+dat3$mist_scores <- as.numeric(dat_mist_scores$scores$scores)
+
+dat_buyn <- dat3[,c("y1", "y4", "y8", "y10", "y13", "y14", "y17", "y19")]
+dat_buyn_scores <- fa.poly(dat_buyn)
+dat3$buyn_scores <- as.numeric(dat_buyn_scores$scores$scores)
+
+#relevel county 
+dat3$REG <- relevel(as.factor(dat3$REG), ref = "4")
+
+#some additional vars
+#dat3$los_at_int <- as.numeric(difftime(dat3$INTDATE, dat3$eps_begin, units = "days"))
+
+#some additional vars
+#dat3$los <- as.numeric(difftime(dat3$eps_end, dat3$eps_begin, units = "days"))
+
+#here we subset our data to the proposed covariates in the model
+
+
+dat4_dcid <- dat3[,c("outcome"
+             ,"mist_scores"
+             ,"wrkg_scores"
+             ,"recep_scores"
+             ,"buyn_scores"
+             ,"log_age_eps_begin"
+             ,"non_min"
+             ,"male"
+             ,"log_par_age"
+             ,"married"
+             ,"hhnum_c"
+             ,"rel_plc"
+             ,"log_eps_rank"
+             ,"housing_hs_cnt"
+             ,"high_in"
+             ,"sm_coll"
+             ,"employ"
+             ,"REG"
+             ,"DCID"
+             )]
+
+dat4_par <- length(unique(na.omit(dat4_dcid)$DCID))
+
+dat4_chi <- nrow(na.omit(dat4_dcid))
+
+dat4 <- dat3[,c("outcome"
+             ,"mist_scores"
+             ,"wrkg_scores"
+             ,"recep_scores"
+             ,"buyn_scores"
+             ,"log_age_eps_begin"
+             ,"non_min"
+             ,"male"
+             ,"log_par_age"
+             ,"married"
+             ,"hhnum_c"
+             ,"rel_plc"
+             ,"log_eps_rank"
+             ,"housing_hs_cnt"
+             ,"high_in"
+             ,"sm_coll"
+             ,"employ"
+             ,"REG"
+             )]
+
+
+dat4$non_min <- as.factor(dat4$non_min)
+dat4$male <- as.factor(dat4$male)
+dat4$married <- as.factor(dat4$married)
+dat4$rel_plc <- as.factor(dat4$rel_plc)
+dat4$high_in <- as.factor(dat4$high_in)
+dat4$sm_coll <- as.factor(dat4$sm_coll)
+dat4$employ <- as.factor(dat4$employ)
+
+levels(dat4$non_min) <- c("Minority Child"
+                          ,"White or Caucasian Child")
+
+levels(dat4$male) <- c("Female Child"
+                       ,"Male Child")
+
+levels(dat4$married) <- c("Child Parents are Not Married"
+                          ,"Child Parents are Married")
+
+levels(dat4$rel_plc) <- c("Longest Placement in a non-Relative Setting"
+                          ,"Longest Placement in a Relative Setting")
+
+levels(dat4$high_in) <- c("Annual Income Less than or Equal to $10,000"
+                          ,"Annual Income More than $10,000")
+
+levels(dat4$sm_coll) <- c("High School or Below"
+                          ,"More than High School")
+
+levels(dat4$employ) <- c("Full or Part Time Employment"
+                         ,"Unemployed")
+
+levels(dat4$REG) <- c("Region 2 South"
+                      ,"Region 1 North"
+                      ,"Region 1 South"
+                      ,"Region 3 South"
+                      ,"Region 3 North"
+                      ,"Region 2 North")
+
+#assign dat4 to data object for sim-tool app
+data <- dat4
+
+data_bma <- na.omit(data)
+
+library(BMA)
+
+reun_bma <- bic.glm(data_bma[,!colnames(data_bma) %in% "outcome"]
+                    ,ifelse(data_bma$outcome == "Reunification", 1, 0)
+                    ,strict = FALSE
+                    ,OR = 20
+                    ,glm.family="binomial"
+                    ,factor.type=TRUE)
+
+#mistrust
+#log_par_age
+#housing_hs_cnt
+#sm_coll
+
+adt_bma <- bic.glm(data_bma[,!colnames(data_bma) %in% "outcome"]
+                    ,ifelse(data_bma$outcome == "Adoption", 1, 0)
+                    ,strict = FALSE
+                    ,OR = 20
+                    ,glm.family="binomial"
+                    ,factor.type=TRUE)
+
+#working relationship
+#log_age_eps_begin
+#housing_hs_cnt
+#sm_coll
+
+gdn_bma <- bic.glm(data_bma[,!colnames(data_bma) %in% "outcome"]
+                    ,ifelse(data_bma$outcome == "Guardianship", 1, 0)
+                    ,strict = FALSE
+                    ,OR = 20
+                    ,glm.family="binomial"
+                    ,factor.type=TRUE)
+
+#log_age_eps_begin
+#married
+#rel_plc
+#employment
+#hhnum_c
+
+emc_bma <- bic.glm(data_bma[,!colnames(data_bma) %in% "outcome"]
+                    ,ifelse(data_bma$outcome == "Emancipation", 1, 0)
+                    ,strict = FALSE
+                    ,OR = 20
+                    ,glm.family="binomial"
+                    ,factor.type=TRUE)
+
+
+#housing_hs_cnt
+#log_age_eps_begin
+
+#Total List of Variables
+
+#mistrust
+#log_par_age
+#housing_hs_cnt
+#sm_coll
+#log_age_eps_begin
+#married
+#rel_plc
+#employment
+#working relationship
+
+# run the multinomial model
+model_bma_null <- multinom(outcome ~ 1
+                 ,data = na.omit(data)
+                 ,Hess = TRUE)
+
+BIC(model_bma_null)
+
+model_bma <- multinom(outcome ~ mist_scores + wrkg_scores + log_age_eps_begin + log_par_age + rel_plc + employ + housing_hs_cnt + hhnum_c + sm_coll + married
+                 ,data = na.omit(data)
+                 ,Hess = TRUE)
+BIC(model_bma)
+
+model_bma_int_max <- multinom(outcome ~ mist_scores + wrkg_scores + log_age_eps_begin + log_par_age + rel_plc + employ + housing_hs_cnt + hhnum_c + sm_coll + married +
+                     mist_scores*housing_hs_cnt + 
+                     mist_scores*employ +
+                     mist_scores*sm_coll + 
+                     wrkg_scores*housing_hs_cnt +
+                     wrkg_scores*employ +
+                     mist_scores*sm_coll                       
+                 ,data = na.omit(data)
+                 ,Hess = TRUE)
+
+BIC(model_bma_int_max)
+
+model_bma_int_min <- multinom(outcome ~ mist_scores + wrkg_scores + log_age_eps_begin + log_par_age + rel_plc + employ + housing_hs_cnt + hhnum_c + sm_coll + married +
+                     #mist_scores*housing_hs_cnt 
+                     mist_scores*employ 
+                     #mist_scores*sm_coll  
+                     #wrkg_scores*housing_hs_cnt 
+                     #wrkg_scores*employ 
+                     #mist_scores*sm_coll                       
+                 ,data = na.omit(data)
+                 ,Hess = TRUE)
+
+
+BIC(model_bma_int_min)
+
+model_bma_cnt_max <- multinom(outcome ~ mist_scores + wrkg_scores + log_age_eps_begin + log_par_age + rel_plc + employ + housing_hs_cnt + hhnum_c + sm_coll + married +
+                          male + 
+                          non_min
+                 ,data = na.omit(data)
+                 ,Hess = TRUE)
+
+
+model_bma_cnt_min <- multinom(outcome ~ mist_scores + wrkg_scores + log_age_eps_begin + log_par_age + rel_plc + employ + housing_hs_cnt + hhnum_c + sm_coll + married +
+                          male 
+                 ,data = na.omit(data)
+                 ,Hess = TRUE)
+
+BIC(model_bma)-BIC(model_bma_cnt_min)
+```
+
+
+This study is based on an original survey of families involved with the Washington child welfare system in calendar year 2008. Families were eligible for participation in the survey if their cases had been open for at least 30 but not more than 180 days. Families were also excluded if the primary caretaker was incarcerated, under the age of 18, resided outside of the State of Washington, or could not verbally communicate in English. A stratified random sampling technique was utilized to obtain a sample of families receiving both in-home and out-of-home services. The survey had an overall response rate of 82 percent which resulted in a final sample of 809 families. The primary caregiver in each family was interviewed between July and December of 2008. Information was collected concerning the primary caregiver’s perceived individual needs and their views of the child welfare system. Data from this survey were subsequently linked to administrative data from the child welfare system to facilitate analyses examining the relationship between parent factors assessed in the survey and outcomes in the child welfare system.
+
+##Sample
+
+The current study focuses on a subset of the aforementioned families who had at least one child placed in out-of-home care for at least one day (n = `r dat2_par`). These children (n = `r dat2_chi`) were followed using the aforementioned administrative data until December 31, 2014. A small number of these children (n = `r dat2_chi - sum(dat2$crt_s)`) entered out-of-home care outside of the dependency court system through a voluntary placement agreement or some other mechanism. As previous research has identified the importance of distinguishing between children placed into out-of-home care through the court system and children placed through other mechanisms [@CourtneyAndHook2012] in conjunction with the fact that the small number of children entering outside of the dependency court system prevents inclusion in the current analysis, we exclude these children from our analysis. After excluding these children, we identify an additional `r table(subset(dat2, dat2$crt_s == 1)$outcome)[4]` children who have exited to some form of permanency other than adoption, emancipation, guardianship, or reunification (e.g. transfer to another state). As these children represent atypical cases for the child welfare system, they are also excluded from analysis. An additional `r table(subset(dat2, dat2$crt_s == 1)$outcome)[6]` children have not yet exited to permanency by our last observation. While studies examining permanency outcomes would typically retain these subjects and utilize an analytic approach which accounts for the fact that some of the sample has not yet experienced an outcome [e.g. @Goerge1990], the fact that the number of subjects accounts for such a small proportion of our overall sample caused us to also exclude these individuals from our analysis in favor of more flexibility in statisical modeling approaches. Finally, during the analysis phase of our study, an additional `r dat3_chi-dat4_chi` children were excluded as the result of listwise deletion. The final sample includes observations of `r dat4_par` families and `r dat4_chi` children.
+
+##Variables
+
+###Independent variables
+
+####Caretaker engagement 
+
+Survey respondents completed the @Yatchmenoff2005 engagement measure (YEM). These scales measure engagement along the following four dimensions: receptivity, buy-in, working relationship, and mistrust. Since separate analyses [@Mienko2015] indicate that the second-level engagement factor identified by Yatchmenoff does not hold in our data, we enter separate factor score terms for receptivity ($x_{recp}$), buy-in ($x_{buyn}$), working relationship ($x_{wrkg}$), and mistrust ($x_{mist}$) into our analysis. Values for each of these terms are calculated on the basis of factor scores for each of the four dimensions using the `fa.poly()` function in the `psych` package from the statistical programming language, R [@psych]. 
+
+####Socio-economic status (SES) variables 
+
+As studies of patient engagement in the healthcare sector [@HibbardAndCunningham2008] have found engagement to be positively correlated with SES, our statistical analysis will also control for variables related to SES as additional independent measures. Our survey specifically collected data concerning household income, caretaker education, and housing hardships.  The specific operationalization of these variables is provided below. Table 1 provides descriptive data on these variables.
+
+####Household income 
+
+Household income ($x_{hinc}$) was originally measured by providing the survey respondent with a list of incomes given in 10,000 dollar brackets. Respondents were asked to identify their gross household income in 2007. Nearly half of the respondents (47 percent) reported that their gross household income was less than 10,000 dollars. For the current analysis, household income was measured as a binary variable indicating whether family income was greater than 10,000 dollars.
+
+####Parental employment
+
+Parental employment ($x_{pemp}$) was originally measured by asking parents whether or not they were employed full-time, part-time, or not at all. For the current analysis, parental employment was measured as a binary variable indicating whether the parent reported any employment (i.e. full or part-time employment). 
+
+####Parental education 
+
+Parental education ($x_{pedu}$) was originally measured by providing the survey respondent with a list of educational levels and asking the respondent to identify their highest level of education. Approximately one-third of the respondents had completed more than a high-school education. For the current analysis, caretaker education was measured as a binary variable indicating whether the caretaker's education was greater than or equal to high-school.
+
+####Housing hardship 
+
+Survey respondents were asked several questions regarding their housing status over the past 12 months. All respondents were asked whether they had experienced a period of homelessness. Additional questions were asked concerning the extent to which parents had experienced an eviction or had been required to seek shelter from family or friends. For the current analysis, housing hardship ($x_{hshp}$) was measured as an integer variable representing the total number of the following hardships the respondent had experienced in the last 12 months: eviction, homelessness, or an instance in which they had been required to seek shelter from friends or family.
+
+####Child-level control variables 
+
+Due to the consistent findings of race and age effects in the reunification and permanency literature, the current analysis also included control variables of age and minority status. For the current analysis, minority status was included as a binary construct coded to indicate whether the child was White or Caucasian ($x_{whte}$). Age was included as an integer variable indicate the log-tranformed age of a child, in years, at the point of removal ($x_{cage}$). The sex of the child was coded as a binary variable indicating a male child ($x_{male}$). Administrative data was also utlized to include the count of prior placements ($x_{prio}$) for a given child. The analysis also included a binary variable indicating whether or not the child experienced their longest placement in the care of a relative ($x_{relp}$). 
+
+####Family-level control variables 
+
+Various family-level variables collected in the survey were also included in this analysis. Similar to the child level control variables, the log-transformed age of the main caretaker at the point of removal was also included ($x_{page}$). The study also included a binary indicator as to whether or the parents are married ($x_{pmar}$) and the total number of children ($x_{hchd}$) in the household at the point of the interview. Due to previous analyses indicating substantial regional variation in the child welfare outcomes in Washington State [@CourtneyAndHook2012], the current analysis also included administrative region ($x_{areg}$) as a categorical measure. 
+
+###Dependent variable
+
+We examine the proability that a child will experience one of four types of permanency outcomes: Reunification ($R$) - which includes all legal reunifications and trial-returns-home lasting more than six months, Adoption ($A$) - which includes all legal adoptions, Guardianship ($G$) - which includes formal guardianships and temporary custody agreements which allow for case-closure in Washington, and Emancipation ($E$) - which includes any instance in which a child was legally emancipated and instances in which a child reached the age of majority prior to achieiving legal permanency. We are specifically interested in calculating this probability as a function of the independent variables identified above. This probability is estimated using a multinomial logisitic regression model in which reunification, as our largest category, is selected as the reference category. 
+
+##Statistical Modeling
+
+###Probability model
+
+In multinomial regression, the general formula for a particular outcome probability is given as 
+$$
+\Pr(y_i=j|\mathbf{X}_i, \mathbf{\beta_2},...,\mathbf{\beta_M})=\frac{\exp(\mathbf{X}_i\mathbf{\beta_j})}{\sum_{k=1}^{K}\exp(\mathbf{X}_i\mathbf{\beta_k})}
+$$
+
+where $i$ is an index of $N$ observations, $j$ is an index of the $M$ categories of regression (with 1 equal to the reference category), $\mathbf{X}$ is a vector of covariates in the regression model, and $\mathbf{\beta}$ is a vector of coefficients associated with each covariate.
+
+We thus have probability formulas for each of our outcomes as follows:
+
+$$
+\Pr(y_i=R|\mathbf{X}_i, \mathbf{\beta_A},\mathbf{\beta_G},\mathbf{\beta_E})=\frac{1}{1 + \exp(\mathbf{X}_i\mathbf{\beta_A}) + \exp(\mathbf{X}_i\mathbf{\beta_G}) + \exp(\mathbf{X}_i\mathbf{\beta_E})}
+$$
+
+$$
+\Pr(y_i=A|\mathbf{X}_i, \mathbf{\beta_A},\mathbf{\beta_G},\mathbf{\beta_E})=\frac{\exp(\mathbf{X}_i\mathbf{\beta_A})}{1 + \exp(\mathbf{X}_i\mathbf{\beta_A}) + \exp(\mathbf{X}_i\mathbf{\beta_G}) + \exp(\mathbf{X}_i\mathbf{\beta_E})}
+$$
+
+$$
+\Pr(y_i=G|\mathbf{X}_i, \mathbf{\beta_A},\mathbf{\beta_G},\mathbf{\beta_E})=\frac{\exp(\mathbf{X}_i\mathbf{\beta_G})}{1 + \exp(\mathbf{X}_i\mathbf{\beta_A}) + \exp(\mathbf{X}_i\mathbf{\beta_G}) + \exp(\mathbf{X}_i\mathbf{\beta_E})}
+$$
+
+$$
+\Pr(y_i=E|\mathbf{X}_i, \mathbf{\beta_A},\mathbf{\beta_G},\mathbf{\beta_E})=\frac{\exp(\mathbf{X}_i\mathbf{\beta_E})}{1 + \exp(\mathbf{X}_i\mathbf{\beta_A}) + \exp(\mathbf{X}_i\mathbf{\beta_G}) + \exp(\mathbf{X}_i\mathbf{\beta_E})}.
+$$
+
+###Statistical model development and selection
+
+Prior to estimation, we subject our covariates to Bayesian Model Averaging (BMA) across binomial generalized linear models (GLMs) (i.e. logistic regression models) for each outcome in our analysis to determine the most probable set of covariates for a given outcome. The details of BMA are beyond the scope of this paper. The reader is directed to @Hoeting1999 for a discussion of the overall approach. Briefly, BMA is a process through which a researcher identifies a set of potential $k$ covariates and a candidate statistical model (e.g. a binomial generalized linear model (GLM)). The analyst then estimates the statistical model for every possible combination of models ($2^k$ models). Each model receives a weighting based on the posterior probability of the model beginning with a prior probability which represents the researcher's beliefs prior to conducting the analysis. For the current problem, we begin with a uniform prior in which we make no substantive *a priori* assumptions about our models. The BMA is implemented via the `BMA` package in R [@BMA]. 
+
+For each outcome, we select the set of covariates associated with the statistical model with the highest posterior probability for a particular outcome. We then estimate our mulinomial regression model using the `multinom()` function from the `nnet` package [@nnet]. The multinomial model makes use of the joint set of covariates identified across all BMA analyses. As a confirmation of the BMA process and to display model fit statistics in a manner more familiar to social welfare scholars, we compare the fit of the model utilizing the BMA-chosen covariates with three additional models: 1. A null model, 2. A model examining key interactions between our chosen measure of engagement and measures of SES, and 3. A model including any traditional control variables (e.g. race) that were excluded with through the BMA analysis.  
+
+#Results
+
+## Statistical analysis
+
+The results of BMA analysis yielded the variables listed in Table 1. In addition to the BMA-chosen variables, Table 1 also includes traditional control variables ($x_{whte}$ and $x_{male}$). While these variables were not chose by the BMA process, they will be included in a model to be tested against the model utilizing the BMA-chosen covariates.  
+
+```{r analysis_results_desc, results="asis", echo=FALSE, message=FALSE}
+
+sum_mist <- sqldf("
+select 
+  avg(mist_scores) mean_mist_scores
+  ,stdev(mist_scores) sd_mist_scores
+from data_bma
+group by 
+  outcome
+order by 
+  outcome 
+")
+
+
+sum_wrkg <- sqldf("
+select 
+  avg(wrkg_scores) mean_wrkg_scores
+  ,stdev(wrkg_scores) sd_wrkg_scores
+  ,outcome
+from data_bma
+group by 
+  outcome
+")
+
+
+sum_ch_age <- sqldf("
+select 
+  avg(exp(log_age_eps_begin)-1) mean_age_eps_begin
+  ,stdev(exp(log_age_eps_begin)-1) sd_age_eps_begin
+  ,outcome
+from data_bma
+group by 
+  outcome
+")
+
+sum_pr_age <- sqldf("
+select 
+  avg(exp(log_par_age)) mean_page_eps_begin
+  ,stdev(exp(log_par_age)) sd_page_eps_begin
+  ,outcome
+from data_bma
+group by 
+  outcome
+")
+
+sum_hhnum_c <- sqldf("
+select 
+  avg(hhnum_c) mean_hhnum_c
+  ,stdev(hhnum_c) sd_hhnum_c
+  ,outcome
+from data_bma
+group by 
+  outcome
+")
+
+sum_hs_cnt <- sqldf("
+select 
+  avg(housing_hs_cnt) mean_housing_hs_cnt
+  ,stdev(housing_hs_cnt) sd_housing_hs_cnt
+  ,outcome
+from data_bma
+group by 
+  outcome
+")
+
+sum_sm_col <- sqldf("
+select 
+  avg(case
+    when sm_coll = 'More than High School'
+    then 1
+    else 0 
+  end)*100.0 percent_sm_col
+  ,null sd_percent_sm_col
+  ,outcome
+from data_bma
+group by 
+  outcome
+")
+
+
+sum_emp <- sqldf("
+select 
+  avg(case
+    when employ = 'Full or Part Time Employment'
+    then 1
+    else 0 
+  end)*100.0 percent_employed
+  ,null sd_percent_employed
+  ,outcome
+from data_bma
+group by 
+  outcome
+")
+
+sum_mar <- sqldf("
+select 
+  avg(case
+    when married = 'Child Parents are Married'
+    then 1
+    else 0 
+  end)*100 percent_married
+  ,null sd_percent_married
+  ,outcome
+from data_bma
+group by 
+  outcome
+")
+
+sum_rel <- sqldf("
+select 
+  avg(case
+    when rel_plc = 'Longest Placement in a Relative Setting'
+    then 1
+    else 0 
+  end)*100 percent_relative
+  ,null sd_percent_relative
+  ,outcome
+from data_bma
+group by 
+  outcome
+")
+
+sum_white <- sqldf("
+select 
+  avg(case
+    when non_min = 'White or Caucasian Child'
+    then 1
+    else 0 
+  end)*100 percent_white
+  ,null sd_percent_white
+  ,outcome
+from data_bma
+group by 
+  outcome
+")
+
+sum_male <- sqldf("
+select 
+  avg(case
+    when male = 'Male Child'
+    then 1
+    else 0 
+  end)*100 percent_male
+  ,null sd_percent_male
+  ,outcome
+from data_bma
+group by 
+  outcome
+")
+
+sum_outcome <- sqldf("
+select 
+  count(*)*100.0/ttl_count percent_outcome
+  ,null sd_outcome 
+  ,outcome
+from data_bma, (select count(*) ttl_count from data_bma)
+group by 
+  outcome 
+")
+
+
+data_desc <- data.frame(Adoption=NA
+                        ,Emancipation=NA
+                        ,Guardianship=NA
+                        ,Reunification=NA)
+
+data_desc[1,] <- paste0(round(sum_outcome$percent_outcome,2),"\\%")
+
+data_desc[2,] <- paste0(round(sum_mist$mean_mist_scores,2)
+                        ," ("
+                        ,round(sum_mist$sd_mist_scores,2)
+                        ,")")
+
+data_desc[3,] <- paste0(round(sum_wrkg$mean_wrkg_scores,2)
+                        ," ("
+                        ,round(sum_wrkg$sd_wrkg_scores,2)
+                        ,")")
+
+data_desc[4,] <- paste0(round(sum_ch_age$mean_age_eps_begin,2)
+                        ," ("
+                        ,round(sum_ch_age$sd_age_eps_begin,2)
+                        ,")")
+
+data_desc[5,] <- paste0(round(sum_pr_age$mean_page_eps_begin,2)
+                        ," ("
+                        ,round(sum_pr_age$sd_page_eps_begin,2)
+                        ,")")
+
+data_desc[6,] <- paste0(round(sum_hhnum_c$mean_hhnum_c,2)
+                        ," ("
+                        ,round(sum_hhnum_c$sd_hhnum_c,2)
+                        ,")")
+
+data_desc[7,] <- paste0(round(sum_hs_cnt$mean_housing_hs_cnt,2)
+                        ," ("
+                        ,round(sum_hs_cnt$sd_housing_hs_cnt,2)
+                        ,")")
+
+data_desc[8,] <- paste0(round(sum_sm_col$percent_sm_col,2),"\\%")
+
+data_desc[9,] <- paste0(round(sum_emp$percent_employed,2),"\\%")
+
+data_desc[10,] <- paste0(round(sum_mar$percent_married,2),"\\%")
+
+data_desc[11,] <- paste0(round(sum_rel$percent_relative,2),"\\%")
+
+data_desc[12,] <- paste0(round(sum_white$percent_white,2),"\\%")
+
+data_desc[13,] <- paste0(round(sum_male$percent_male,2),"\\%")
+
+rownames(data_desc) <- c("$\\text{\\%/Outcome}$"
+                         ,"$x_{mist}$"
+                         ,"$x_{wrkg}$"
+                         ,"$x_{cage}$"
+                         ,"$x_{page}$"
+                         ,"$x_{hchd}$"
+                         ,"$x_{hshp}$"
+                         ,"$x_{pedu}$"                         
+                         ,"$x_{pemp}$"
+                         ,"$x_{pmar}$"                         
+                         ,"$x_{relp}$"
+                         ,"$x_{whte}$"  
+                         ,"$x_{male}$"                         
+)
+
+
+#covariates chosen for reunification
+#mistrust
+data_desc[2,4] <- paste0(data_desc[2,4], "$\\dagger$")
+#parent age
+data_desc[5,4] <- paste0(data_desc[5,4], "$\\dagger$")
+#housing hardships
+data_desc[7,4] <- paste0(data_desc[7,4], "$\\dagger$")
+#parent education
+data_desc[8,4] <- paste0(data_desc[8,4], "$\\dagger$")
+
+#covariates chosen for adoption 
+#working
+data_desc[3,1] <- paste0(data_desc[3,1], "$\\dagger$")
+#child age
+data_desc[4,1] <- paste0(data_desc[4,1], "$\\dagger$")
+#housing hardships
+data_desc[7,1] <- paste0(data_desc[7,1], "$\\dagger$")
+#parent education
+data_desc[8,1] <- paste0(data_desc[8,1], "$\\dagger$")
+
+#covariates chosen for guardianship
+#child age
+data_desc[4,3] <- paste0(data_desc[4,3], "$\\dagger$")
+#household children  
+data_desc[6,3] <- paste0(data_desc[6,3], "$\\dagger$")
+#parent employment 
+data_desc[9,3] <- paste0(data_desc[9,3], "$\\dagger$")
+#parents married 
+data_desc[10,3] <- paste0(data_desc[10,3], "$\\dagger$")
+#relative placement 
+data_desc[11,3] <- paste0(data_desc[11,3], "$\\dagger$")
+
+#covariates chosen for emancipation
+#child age
+data_desc[4,2] <- paste0(data_desc[4,2], "$\\dagger$")
+#housing hardships 
+data_desc[7,2] <- paste0(data_desc[7,2], "$\\dagger$")
+
+#xtable(data_desc) #latex
+#print(xtable(data_desc),comment=FALSE,type="html") #html
+kable(data_desc
+      ,align = c("c", "c", "c", "c")
+      ,caption = "Table 1. Descriptive Statistics of Tested Variables (Mean/Percentage (Standard Deviation))"      
+      ) 
+
+```
+
+As described above, the second stage of our model selection analysis involved testing a multinomial logisitic regression model including only the BMA-chosen covariates against models with 1. interaction terms involving our engagement variables and measures of socio-economic status, and 2. models with more traditional covariates of child race [e.g. @HarrisAndCourtney2003] and child gender [e.g. @KempAndBodonyi2000]. The comparison of these models on the basis of the BIC is shown in Table 2 below. As multiple models were tested in both the "interaction term" and "traditional covariate" categories, we present only the minimum BIC values in the table below. As can be seen, using the terminology suggested by @KassAndRaftery1995, the BIC comparisons indicate that the strength of evidence against the NULL model (as compared to the BMA-chosen model) is "decisive". The strength of evidence against the traditional covariate or interaction categories of models is "strong". As such, we select a model including only the BMA-chosen covariates as our final model. 
+
+```{r analysis_results_bic, results="asis", echo=FALSE, message=FALSE}
+# 
+# BIC_values <- c(paste0(round(BIC(model_bma_null),2))
+#                 ,paste0(round(BIC(model_bma),2))
+#                 ,paste0(round(BIC(model_bma_int_min),2)
+#                         ," to "
+#                         ,round(BIC(model_bma_int_max),2))
+#                 ,paste0(round(BIC(model_bma_cnt_min),2)
+#                         ," to "
+#                         ,round(BIC(model_bma_cnt_max),2))                
+#                 )
+
+
+BIC_values <- c(paste0(round(BIC(model_bma_null),2))
+                ,paste0(round(BIC(model_bma),2))
+                ,paste0(round(BIC(model_bma_int_min),2))
+                ,paste0(round(BIC(model_bma_cnt_min),2))                
+                )
+
+
+# BIC_diffs <- c(paste0("--")
+#                 ,paste0(round(BIC(model_bma)-BIC(model_bma_null),2))
+#                 ,paste0(round(BIC(model_bma_int_min)-BIC(model_bma),2)
+#                         ," to "
+#                         ,round(BIC(model_bma_int_max)-BIC(model_bma),2))
+#                 ,paste0(round(BIC(model_bma_cnt_min)-BIC(model_bma),2)
+#                         ," to "
+#                         ,round(BIC(model_bma_cnt_max)-BIC(model_bma),2))               
+#                 )
+
+
+BIC_diffs <- c(paste0("--")
+                ,paste0(round(BIC(model_bma)-BIC(model_bma_null),2))
+                ,paste0(round(BIC(model_bma_int_min)-BIC(model_bma),2))
+                ,paste0(round(BIC(model_bma_cnt_min)-BIC(model_bma),2))               
+                )
+
+
+comp_models <- c("--"
+                  ,"NULL Model"
+                  ,"BMA Model"
+                  ,"BMA Model")
+
+BIC_summary <- data.frame(BIC_values=BIC_values
+                          ,BIC_diffs=BIC_diffs
+                          ,comp_models=comp_models)
+
+
+colnames(BIC_summary) <- c("Minimum BIC Values", "BIC Differences", "Comparison Model")
+
+rownames(BIC_summary) <- c("NULL Model"
+                          ,"BMA Model"
+                          ,"+ Interactions"
+                          ,"+ Controls")
+
+kable(BIC_summary
+      ,align = c("c", "c", "l")
+      ,caption = "Table 2. BIC Comparisons Against Non-BMA Models"
+      ) 
+
+```
+
+Parameter estimates for our final multinomial logistic regression model are displayed in Table 3 below. As indicated above, the model is estimated with Reunification as a reference category to the other 3 permanency outcomes. Thus, the parameter estimates can not be read as *direct* effects on a given permanency outcome - they must be read as the effect on the permanency outcome (with respect to) Reunification. 
+
+```{r analysis_results_model, results="asis", echo=FALSE, message=FALSE}
+z <- summary(model_bma)$coefficients/summary(model_bma)$standard.errors
+# 2-tailed Wald z tests to test significance of coefficients
+p <- (1 - pnorm(abs(z), 0, 1)) * 2
+
+star <- function(pval) {
+  ifelse(pval <= 0.001, "***"
+         ,ifelse(pval <= 0.01, "**"
+                 ,ifelse(pval <= 0.05, "*", "")
+                 )
+         )
+}
+
+rotate <- function(x) t(apply(x, 2, rev))
+
+model_results <- cbind(as.data.frame(round(rotate(summary(model_bma)$coefficients), 2))
+      ,as.data.frame(round(rotate(summary(model_bma)$standard.errors), 2))
+      ,as.data.frame(rotate(star(p))))
+
+model_results <- model_results[,c(1,4,7,2,5,8,3,6,9)]
+
+gdn_results <- paste0(model_results[,1], " (", model_results[,2], ")", model_results[,3])
+
+emc_results <- paste0(model_results[,4], " (", model_results[,5], ")", model_results[,6])
+
+adt_results <- paste0(model_results[,7], " (", model_results[,8], ")", model_results[,9])
+
+model_results <- data.frame(Adoption = adt_results, Emancipation = emc_results, Guardianship = gdn_results)
+
+rownames(model_results) <- c("$\\beta_0$"
+                         ,"$\\beta_{mist}$"
+                         ,"$\\beta_{wrkg}$"
+                         ,"$\\beta_{cage}$"
+                         ,"$\\beta_{page}$"
+                         ,"$\\beta_{relp}$"                         
+                         ,"$\\beta_{pemp}$"
+                         ,"$\\beta_{hshp}$"
+                         ,"$\\beta_{hchd}$"
+                         ,"$\\beta_{pedu}$"                         
+                         ,"$\\beta_{pmar}$"                         
+)
+
+kable(model_results
+      ,align = c("l", "l", "l")
+      ,caption = "Table 3. Final Model Parameter Estimates"      
+      ) 
+```
+
+
+## Visualization of results
+
+```{r analysis_results_viz_calc_and_wrkg, results="asis", echo=FALSE, message=FALSE, fig.width=8, fig.height=7}
+
+#extract params
+pe <- model_bma$wts[c(14:24,26:36,38:48)]
+
+#run the multinomial model
+vc <- solve(model_bma$Hess) 
+
+#assign a variable for the number of simulations
+sims <- 10000
+
+#draw the indicates number of beta simulates 
+#using our extracted model data
+simbetas <- mvrnorm(sims,pe,vc)
+
+simb <- array(NA, dim = c(sims,11,3))
+simb[,,1] <- simbetas[,1:11]         
+simb[,,2] <- simbetas[,12:22]
+simb[,,3] <- simbetas[,23:33]
+
+wrkgrange <- seq(min(data_bma$wrkg_scores)
+                 ,max(data_bma$wrkg_scores)
+                 ,by=0.1)    
+
+mistrange <- seq(min(data_bma$mist_scores)
+                 ,max(data_bma$mist_scores)
+                 ,by=0.1)  
+
+xhyp_wrkg <- cfFactorial(mist_scores = wrkgrange
+                         ,mist_scores = mean(data_bma$mist_scores)
+                         ,log_age_eps_begin = mean(data_bma$log_age_eps_begin)
+                         ,log_par_age = mean(data_bma$log_par_age)
+                         ,rel_plc = prop.table(table(data_bma$rel_plc))[2]
+                         ,employ = prop.table(table(data_bma$employ))[1]
+                         ,housing_hs_cnt = mean(data_bma$housing_hs_cnt)
+                         ,hhnum_c = mean(data_bma$hhnum_c)
+                         ,sm_coll = prop.table(table(data_bma$sm_coll))[2]
+                         ,married = prop.table(table(data_bma$married))[2]
+                         )
+
+xhyp_mist <- cfFactorial(mist_scores = mean(data_bma$mist_scores)
+                         ,mist_scores = mistrange
+                         ,log_age_eps_begin = mean(data_bma$log_age_eps_begin)
+                         ,log_par_age = mean(data_bma$log_par_age)
+                         ,rel_plc = prop.table(table(data_bma$rel_plc))[2]
+                         ,employ = prop.table(table(data_bma$employ))[1]
+                         ,housing_hs_cnt = mean(data_bma$housing_hs_cnt)
+                         ,hhnum_c = mean(data_bma$hhnum_c)
+                         ,sm_coll = prop.table(table(data_bma$sm_coll))[2]
+                         ,married = prop.table(table(data_bma$married))[2]
+                         )
+
+test_sims_wrkg <- mlogitsimev(xhyp_wrkg,simb,ci=0.95)
+
+test_sims_mist <- mlogitsimev(xhyp_mist,simb,ci=0.95)
+
+y_wrkg <- as.vector(test_sims_wrkg$pe[,1:4])
+
+y_mist <- as.vector(test_sims_mist$pe[,1:4])
+
+x_wrkg <- rep(seq(from=min(wrkgrange), to=max(wrkgrange), length.out=31), 4)
+
+x_mist <- rep(seq(from=min(mistrange), to=max(mistrange), length.out=34), 4)
+
+lower_mist <- as.vector(test_sims_mist$lower[,1:4,])
+
+upper_mist <- as.vector(test_sims_mist$upper[,1:4,])
+
+lower_wrkg <- as.vector(test_sims_wrkg$lower[,1:4,])
+
+upper_wrkg <- as.vector(test_sims_wrkg$upper[,1:4,])
+
+Outcome_wrkg <- c(rep("Reunification", 31)
+                 ,rep("Emancipation"
+                      ,31)
+                 ,rep("Guardianship"
+                      ,31)
+                 ,rep("Adoption"
+                      ,31))
+
+
+Outcome_mist <- c(rep("Reunification", 34)
+                 ,rep("Emancipation"
+                      ,34)
+                 ,rep("Guardianship"
+                      ,34)
+                 ,rep("Adoption"
+                      ,34))
+
+
+dat_sim_plot_wrkg <- data.frame(y_wrkg,x_wrkg,lower_wrkg,upper_wrkg,Outcome=Outcome_wrkg)
+
+dat_sim_plot_mist <- data.frame(y_mist,x_mist,lower_mist,upper_mist,Outcome=Outcome_mist)
+
+
+p_wrkg <- ggplot(dat_sim_plot_wrkg
+                 ,aes(x=x_wrkg, y=y_wrkg, group=Outcome)) + 
+  geom_line(size=1, alpha=.5) +
+  geom_ribbon(aes(ymin=lower_wrkg
+                  ,ymax=upper_wrkg
+                  ,fill=Outcome)
+              ,alpha=.5) +
+  ylab(expression('Pr(Outcome|x'[wrkg]*','*italic('ceteris paribus')*')')) +
+  xlab("Level of Working Relationship") +
+  theme_bw() 
+
+
+p_mist <- ggplot(dat_sim_plot_mist
+                 ,aes(x=x_mist, y=y_mist, group=Outcome)) + 
+  geom_line(size=1, alpha=.5) +
+  geom_ribbon(aes(ymin=lower_mist
+                  ,ymax=upper_mist
+                  ,fill=Outcome)
+              ,alpha=.5) +
+  ylab(expression('Pr(Outcome|x'[mist]*','*italic('ceteris paribus')*')')) +
+  xlab("Level of Mistrust") +
+  theme_bw() 
+
+p_wrkg
+
+```
+
+```{r analysis_results_viz_mist, results="asis", echo=FALSE, message=FALSE}
+
+p_mist
+
+```
+
+# References

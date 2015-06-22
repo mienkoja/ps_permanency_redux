@@ -10,34 +10,8 @@ output:
 ---
 
 ```{r preliminary, include=FALSE}
-#load citation package and clear the bibliography
-require(bibtex)
-require(knitcitations)
-newbib()
-write.bib(c('RODBC', 'xtable', 'mstate', 'survival', 'reshape2', 'ggplot2', 'extrafont', 'pander', 'sqldf', 'ltm'), file="package.bib")
-packbib <- read.bib("package.bib")
-regbib <- read.bib("bibliography.bib")
-
 #load the RODBC library
-require(RODBC)
-#make pretty tables
-require(pander)
-#handle multi-state data
-require(mstate)
-#load ggplot for plotting
-require(ggplot2)
-#load reshape for melting
-require(reshape2)
-#load POC colors, et al.
-require(pocr)
-#load nice fonts
-require(extrafont)
-#allow sql querying of data frames
-require(sqldf)
-#calculate IRT model
-require(ltm)
-
-
+library(RODBC)
 #loan nnet for multinom function 
 library(nnet)
 #load glmnet to help with cross validation 
@@ -46,7 +20,6 @@ library(glmnet)
 library(pander)
 #load lubridate to handle dates
 library(lubridate)
-
 ```
 # Overview
 
@@ -146,169 +119,188 @@ As such, we re-link the `id_prsn_child` fields from the `r dat1_par` records usi
 
 
 ```{r select_reasonable_matches, tidy=FALSE, cache=TRUE}
-dat2 <- sqlQuery(cn, 
-                "with child_rem_id (dcid, id_prsn_child, id_removal_episode_fact) 
-                as
-                (
-                select
-                  tpd.dcid
-                  ,tc.id_prsn_child
-                  ,min(id_removal_episode_fact) id_removal_episode_fact
-                from 
-                	dbo.ps_tbl_parent_data tpd
-                		join dbo.ps_tbl_children tc
-                			on tpd.dcid=tc.dcid
-        						join vw_episodes vep
-        							on vep.eps_begin <= tpd.intdate 
-        								and vep.eps_begin >= dateadd(dd, -365, tpd.intdate)
-                        				and vep.id_prsn_child=tc.id_prsn_child
-                        group by 
-                        	tpd.dcid
-                        	,tc.id_prsn_child
-                        )
-                        select distinct
-        					cri.id_prsn_child
-                        	,cri.id_removal_episode_fact 
-        					--check for records of dependency from AOC data
-        					--for any dependency date that takes place after permanency, set date to null
-        					,case 
-        						when datediff(dd
-                                  ,isnull(vep.petition_dependency_date
-                                          ,vep.eps_begin)
-                                  ,isnull(vep.earlier_of_eps_end_18th_bday
-                                          ,'2013-12-31')) < 0
-        						then null
-        						else vep.petition_dependency_date
-        					end dep_date
-        					--calculate the timing of court involvement 
-        					,case 
-        						--check for petitions before removal and set time to 0
-        						when 
-        							datediff(dd
-                              ,vep.eps_begin
-                              ,isnull(vep.petition_dependency_date
-                                      ,vep.eps_begin)) < 0 
-        						then 
-        							0
-        						--treat missing dependency dates (from logic above) with dur_days 
-                    --greater than 365 as immediate dependencies
-        						when 
-        							case 
-        							
-        								when datediff(dd
-                                      ,isnull(vep.petition_dependency_date
-                                              ,vep.eps_begin)
-                                      ,isnull(vep.earlier_of_eps_end_18th_bday
-                                              ,'2013-12-31')) < 0
-        								then null
-        								else vep.petition_dependency_date
-        							end is null 
-        							and 
-        							dur_days > 365
-        						then 
-        							0
-        						--treat missing dependency dates with dur_days less than 365 as VPA cases
-        						when 
-        							case 	
-        								when datediff(dd
-                                      ,isnull(vep.petition_dependency_date
-                                              ,vep.eps_begin)
-                                      ,isnull(vep.earlier_of_eps_end_18th_bday
-                                              ,'2013-12-31')) < 0
-        								then null
-        								else vep.petition_dependency_date
-        							end is null 
-        						then 
-        							dur_days
-        						--check for petitions after permanency and set time to episode duration
-        						when
-        							datediff(dd
-                                ,vep.petition_dependency_date
-                                ,isnull(vep.earlier_of_eps_end_18th_bday
-                                        ,'2013-12-31')) < 0
-        						then 
-        							dur_days
-        						--for all other cases just calculate the time from 
-                    --eps_begin to the AOC petition 
-        						else 
-        							datediff(dd
-                              ,vep.eps_begin
-                              ,isnull(vep.petition_dependency_date
-                                      ,vep.eps_begin))
-        					end crt_t
-        					,case 
-        						--check for petitions before removal and flag as court involvement
-        						when 
-        							datediff(dd
-                              ,vep.eps_begin
-                              ,isnull(vep.petition_dependency_date
-                                      ,vep.eps_begin)) < 0 
-        						then 
-        							1
-        						--treat missing dependency dates (from logic above) with 
-                    --dur_days greater than 365 as immediate dependencies
-        						when 
-        							case 
-        								when datediff(dd
-                                      ,isnull(vep.petition_dependency_date
-                                              ,vep.eps_begin)
-                                      ,isnull(vep.earlier_of_eps_end_18th_bday
-                                              ,'2013-12-31')) < 0
-        								then null
-        								else vep.petition_dependency_date
-        							end is null 
-        							and 
-        							dur_days > 365
-        						then 
-        							1
-        						--treat missing dependency dates with dur_days less than 365 as VPA cases
-        						when 
-        							case 
-        								when datediff(dd
-                                      ,vep.petition_dependency_date
-                                      ,isnull(vep.earlier_of_eps_end_18th_bday
-                                              ,'2013-12-31')) < 0
-        								then null
-        								else vep.petition_dependency_date
-        							end is null 
-        						then 
-        							0
-        						--check for petitions after permanency and set time to episode duration
-                    --(effectively VPAs)
-        						when
-        							datediff(dd
-                              ,vep.petition_dependency_date
-                              ,isnull(vep.earlier_of_eps_end_18th_bday
-                                      ,'2013-12-31')) < 0
-        						then 
-        							0
-        						--for all other cases just calculate the time from eps_begin to the 
-                    --AOC or CA petition 
-        						else 
-        							1
-        					end crt_s
-        					,dur_days reu_t
-        					,case
-        						when outcome = 'Reunification' then 1 else 0
-        					end reu_s
-        					,dur_days adt_t
-        					,case
-        						when outcome = 'Adoption' then 1 else 0
-        					end adt_s
-        					,dur_days gdn_t
-        					,case
-        						when outcome = 'Guardianship' then 1 else 0
-        					end gdn_s
-  						    ,datediff(dd, vep.eps_begin, tpd.intdate) time_to_int
-        					,tpd.* 
-                  ,vep.*
-                        from
-                        	dbo.ps_tbl_parent_data tpd
-                        		join child_rem_id cri
-                        			on tpd.dcid=cri.dcid
-        						join vw_episodes vep
-        							on vep.id_removal_episode_fact = cri.id_removal_episode_fact
-        				order by vep.id_removal_episode_fact")
+dat2 <- sqlQuery(cn, "
+with child_rem_id as
+(
+select
+    tpd.dcid
+    ,tc.id_prsn_child
+    ,min(id_removal_episode_fact) id_removal_episode_fact
+from poc_survey.ps_tbl_parent_data tpd
+	join poc_survey.ps_tbl_children tc
+		on tpd.dcid=tc.dcid
+	join base.rptPlacement vep
+		on vep.removal_dt <= tpd.intdate 
+			and vep.removal_dt >= dateadd(dd, -365, tpd.intdate)
+			and vep.child=tc.id_prsn_child
+group by 
+    tpd.dcid
+    ,tc.id_prsn_child
+)
+select distinct
+	cri.id_prsn_child
+    ,cri.id_removal_episode_fact 
+    --check for records of dependency from AOC data
+    --for any dependency date that takes place after permanency, set date to null
+    ,case 
+        when datediff(dd
+            ,isnull(vep.dependency_dt
+                    ,vep.removal_dt)
+					,isnull(case
+							when discharge_dt = '9999-12-31'
+							then null
+							when [18bday] < discharge_dt and discharge_dt != '9999-12-31'
+							then [18bday]
+							else discharge_dt
+							end --this case statement calculates earlier_of_eps_end_18th_bday
+					,'2013-12-31')) < 0
+        then null
+        else vep.dependency_dt
+    end dep_date
+    --calculate the timing of court involvement 
+    ,case 
+        --check for petitions before removal and set time to 0
+        when datediff(dd, vep.removal_dt, isnull(vep.dependency_dt, vep.removal_dt)) < 0 
+        then 0
+        --treat missing dependency dates (from logic above) with dur_days 
+		--greater than 365 as immediate dependencies
+        when 
+			case 				
+        		when datediff(dd, isnull(vep.dependency_dt, vep.removal_dt)
+                    ,isnull(case
+								when discharge_dt = '9999-12-31'
+								then null
+								when [18bday] < discharge_dt and discharge_dt != '9999-12-31'
+								then [18bday]
+								else discharge_dt
+							end --this case statement calculates earlier_of_eps_end_18th_bday
+                    ,'2013-12-31')) < 0
+        		then null
+        		else vep.dependency_dt
+        	end is null 
+        	and dur_days > 365
+        then 0
+		--treat missing dependency dates with dur_days less than 365 as VPA cases
+		when 
+        	case 	
+        		when datediff(dd, isnull(vep.dependency_dt, vep.removal_dt)
+					,isnull(case
+								when discharge_dt = '9999-12-31'
+								then null
+								when [18bday] < discharge_dt and discharge_dt != '9999-12-31'
+								then [18bday]
+								else discharge_dt
+							end 
+							--this case statement calculates earlier_of_eps_end_18th_bday
+					,'2013-12-31')) < 0
+        			then null
+        			else vep.dependency_dt
+        	end is null 
+		then dur_days
+		--check for petitions after permanency and set time to episode duration
+		when datediff(dd
+						,vep.dependency_dt
+						,isnull(case
+									when discharge_dt = '9999-12-31'
+									then null
+									when [18bday] < discharge_dt and discharge_dt != '9999-12-31'
+									then [18bday]
+									else discharge_dt
+								end 
+								--this case statement calculates earlier_of_eps_end_18th_bday
+					,'2013-12-31')) < 0
+		then dur_days
+		--for all other cases just calculate the time from removal_dt to the AOC petition 
+		else datediff(dd, vep.removal_dt, isnull(vep.dependency_dt, vep.removal_dt))
+    end crt_t
+    ,case 
+        --check for petitions before removal and flag as court involvement
+        when datediff(dd
+						,vep.removal_dt
+						,isnull(case
+									when discharge_dt = '9999-12-31'
+									then null
+									when [18bday] < discharge_dt and discharge_dt != '9999-12-31'
+									then [18bday]
+									else discharge_dt
+								end 
+								--this case statement calculates earlier_of_eps_end_18th_bday
+								,'2013-12-31')) < 0
+        then 1
+        --treat missing dependency dates (from logic above) 
+		--with dur_days greater than 365 as immediate dependencies
+        when case 
+        		when datediff(dd, isnull(vep.dependency_dt, vep.removal_dt)
+                ,isnull(case
+							when discharge_dt = '9999-12-31'
+							then null
+							when [18bday] < discharge_dt and discharge_dt != '9999-12-31'
+							then [18bday]
+							else discharge_dt
+						end --this case statement calculates earlier_of_eps_end_18th_bday
+						,'2013-12-31')) < 0
+        		then null
+        		else vep.dependency_dt
+        	end is null 
+        	and dur_days > 365
+        then 1
+        --treat missing dependency dates with dur_days less than 365 as VPA cases
+        when 
+        	case 
+        		when datediff(dd
+								,vep.dependency_dt
+								,isnull(case
+											when discharge_dt = '9999-12-31'
+											then null
+											when [18bday] < discharge_dt and discharge_dt != '9999-12-31'
+											then [18bday]
+											else discharge_dt
+										end --this case statement calculates earlier_of_eps_end_18th_bday
+										,'2013-12-31')) < 0
+        		then null
+        		else vep.dependency_dt
+        	end is null 
+        then 0
+        --check for petitions after permanency and set time 
+		--to episode duration (effectively VPAs)
+        when datediff(dd
+						,vep.dependency_dt
+						,isnull(case
+									when discharge_dt = '9999-12-31'
+									then null
+									when [18bday] < discharge_dt and discharge_dt != '9999-12-31'
+									then [18bday]
+									else discharge_dt
+								end --this case statement calculates earlier_of_eps_end_18th_bday
+								,'2013-12-31')) < 0
+        then 0
+        --for all other cases just calculate the time from eps_begin to the AOC or CA petition 
+        else 1
+    end crt_s
+    ,dur_days reu_t
+    ,case
+        when dte.discharge_type = 'Reunification' then 1 else 0
+    end reu_s
+    ,dur_days adt_t
+    ,case
+        when dte.discharge_type = 'Adoption' then 1 else 0
+    end adt_s
+    ,dur_days gdn_t
+    ,case
+		when dte.discharge_type = 'Guardianship' then 1 else 0
+    end gdn_s
+  	,datediff(dd, vep.removal_dt, tpd.intdate) time_to_int
+    ,tpd.* 
+	,vep.*
+from poc_survey.ps_tbl_parent_data tpd
+    join child_rem_id cri
+        on tpd.dcid=cri.dcid
+	join base.rptPlacement vep 
+		on vep.id_removal_episode_fact = cri.id_removal_episode_fact
+	join dbo.ref_lookup_cd_discharge_type_exits dte
+		on dte.cd_discharge_type = vep.cd_discharge_type
+order by vep.id_removal_episode_fact
+")
 
 #count the number of parents
 dat2_par <- length(unique(dat2$DCID))
